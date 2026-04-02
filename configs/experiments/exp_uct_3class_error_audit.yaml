@@ -1,0 +1,29 @@
+experiment_name: exp_uct_3class_error_audit
+task_type: analysis_only
+dataset:
+  name: uct_3class
+input:
+  benchmark_summary: results/exp_bm_uct_3class/benchmark_summary.json
+artifact_policy:
+  schema: standardized_v1
+  create_standard_dirs: true
+  allow_inherited_artifacts: true
+  parent_experiment: exp_bm_uct_3class
+analysis:
+  use_existing_predictions: true
+  generate_confusion_matrix: true
+  generate_normalized_confusion_matrix: true
+  generate_classification_report: true
+  generate_per_class_metrics: true
+  generate_top_confusions: true
+evaluation:
+  metrics:
+    - accuracy
+    - macro_f1
+    - weighted_f1
+    - balanced_accuracy
+  save_confusion_matrix: true
+  save_classification_report: true
+output:
+  results_dir: results/exp_uct_3class_error_audit
+  save_artifact_manifest: true

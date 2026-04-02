@@ -1,0 +1,30 @@
+﻿# Shared schema used to align UCT Student and OULAD for comparable benchmarks.
+shared_schema:
+  entity_id: student_id
+  cohort_id: cohort_id
+  outcome_label: outcome_label
+
+shared_feature_sets:
+  minimal_comparison:
+    - age_band
+    - gender
+    - prior_attainment
+    - registration_delay_days
+    - assessment_submission_rate
+    - vle_clicks_total
+  extended_comparison:
+    - age_band
+    - gender
+    - disability_flag
+    - socio_economic_index
+    - prior_attainment
+    - registration_delay_days
+    - assessment_submission_rate
+    - assessment_score_mean
+    - vle_clicks_total
+    - vle_active_weeks
+
+# Mapping to be consumed by shared_feature_mapper.py.
+feature_name_map:
+  uct_student: {}
+  oulad: {}

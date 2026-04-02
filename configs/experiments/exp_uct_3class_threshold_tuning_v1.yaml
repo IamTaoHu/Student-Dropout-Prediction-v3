@@ -1,0 +1,30 @@
+experiment_name: exp_uct_3class_threshold_tuning_v1
+task_type: posthoc_threshold_tuning
+dataset:
+  name: uct_3class
+input:
+  benchmark_summary: results/exp_uct_3class_boosting_optuna_v1/benchmark_summary.json
+artifact_policy:
+  schema: standardized_v1
+  create_standard_dirs: true
+  allow_inherited_artifacts: true
+  parent_experiment: exp_uct_3class_boosting_optuna_v1
+threshold_tuning:
+  enabled: true
+  strategy: validation_search
+  objective_metric: macro_f1
+  use_saved_probabilities: true
+split:
+  source: validation
+evaluation:
+  metrics:
+    - accuracy
+    - macro_f1
+    - weighted_f1
+    - balanced_accuracy
+  compare_default_argmax: true
+  save_confusion_matrix: true
+  save_classification_report: true
+output:
+  results_dir: results/exp_uct_3class_threshold_tuning_v1
+  save_artifact_manifest: true

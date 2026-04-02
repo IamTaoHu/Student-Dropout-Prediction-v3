@@ -1,0 +1,42 @@
+### Project outputs / large artifacts
+results/
+info/
+tmp_validation/
+
+### Local environments
+env/
+.env/
+venv/
+.venv/
+
+### Python cache / build
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+### Notebooks / IDE / OS noise
+.ipynb_checkpoints/
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+### Logs and temporary files
+*.log
+*.tmp
+*.bak
+
+### Common large data / model files
+*.csv
+*.parquet
+*.feather
+*.h5
+*.hdf5
+*.pkl
+*.joblib
+*.onnx
+*.pt
+*.pth

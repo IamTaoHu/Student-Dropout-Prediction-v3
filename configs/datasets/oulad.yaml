@@ -1,0 +1,76 @@
+﻿# OULAD dataset configuration.
+# Aligned to article_CSEDU_2026:
+# - OULAD is treated as a binary problem
+# - positive class: Withdrawn + Fail
+# - negative class: Pass + Distinction
+
+dataset:
+  name: oulad
+  source_format: csv
+
+paths:
+  raw_root: data/raw/oulad
+  interim_root: data/interim/oulad
+  processed_root: data/processed/oulad
+
+source:
+  delimiter: ","
+  encoding: utf-8
+
+source_tables:
+  assessments: assessments.csv
+  vle: vle.csv
+  studentInfo: studentInfo.csv
+  studentRegistration: studentRegistration.csv
+  studentAssessment: studentAssessment.csv
+  studentVle: studentVle.csv
+  courses: courses.csv
+
+required_tables:
+  - assessments
+  - vle
+  - studentInfo
+  - studentRegistration
+  - studentAssessment
+  - studentVle
+  - courses
+
+schema:
+  entity_id: id_student
+  term_column: code_presentation
+  outcome_column: final_result
+
+features:
+  builder: oulad_paper_features
+  cutoff_day: null
+  include_groups:
+    - demographics
+    - registration_behavior
+    - assessment_behavior
+    - vle_activity
+
+outputs:
+  features_filename: oulad_features.parquet
+
+preprocessing:
+  # Optional dataset-specific leakage guards; merged with experiment-level forbidden columns.
+  forbidden_feature_columns: []
+
+target_mappings:
+  binary:
+    Withdrawn: 1
+    Fail: 1
+    Pass: 0
+    Distinction: 0
+
+  three_class:
+    Withdrawn: 2
+    Fail: 1
+    Pass: 0
+    Distinction: 0
+
+  four_class:
+    Withdrawn: 3
+    Fail: 2
+    Pass: 1
+    Distinction: 0

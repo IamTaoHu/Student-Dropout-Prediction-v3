@@ -1,0 +1,47 @@
+﻿# Benchmark experiment: OULAD, binary target, paper-style setup.
+experiment:
+  id: exp_bm_oulad_binary_paper_style
+  seed: 42
+  dataset_config: configs/datasets/oulad.yaml
+  target_formulation: binary
+
+splits:
+  test_size: 0.2
+  validation_size: 0.2
+  stratify_column: target
+
+preprocessing:
+  imputation: median_mode
+  encoding: onehot
+  scaling: standard
+  outlier:
+    enabled: true
+    method: isolation_forest
+  balancing:
+    enabled: true
+    method: smote
+
+models:
+  candidates:
+    - decision_tree
+    - random_forest
+    - svm
+    - gradient_boosting
+    - xgboost
+    - lightgbm
+    - catboost
+  tuning:
+    backend: optuna
+    n_trials: 20
+    cv_folds: 3
+
+metrics:
+  primary: macro_f1
+  secondary:
+    - accuracy
+    - macro_recall
+    - macro_precision
+    - balanced_accuracy
+
+outputs:
+  results_dir: results/exp_bm_oulad_binary_paper_style

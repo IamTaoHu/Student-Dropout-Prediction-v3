@@ -1,0 +1,39 @@
+experiment_name: exp_uct_3class_boosting_optuna_v1
+task_type: train_eval
+dataset:
+  name: uct_3class
+artifact_policy:
+  schema: standardized_v1
+  create_standard_dirs: true
+  allow_inherited_artifacts: false
+target:
+  mode: 3class
+split:
+  strategy: stratified
+  random_state: 42
+preprocessing:
+  imputation: median_mode
+  encoding: onehot
+  scaling: standard
+models:
+  - xgboost_optuna
+  - lightgbm_optuna
+  - catboost_optuna
+optimization:
+  engine: optuna
+  objective_metric: macro_f1
+  n_trials: 30
+  direction: maximize
+training:
+  use_class_weights: false
+evaluation:
+  metrics:
+    - accuracy
+    - macro_f1
+    - weighted_f1
+    - balanced_accuracy
+  save_confusion_matrix: true
+  save_classification_report: true
+output:
+  results_dir: results/exp_uct_3class_boosting_optuna_v1
+  save_artifact_manifest: true

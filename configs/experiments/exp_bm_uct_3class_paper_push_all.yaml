@@ -1,0 +1,70 @@
+﻿# Paper-aligned benchmark experiment: UCT Student, strict 3-class, bundled model family.
+experiment:
+  id: exp_bm_uct_3class_paper_push_all
+  seed: 42
+  dataset_config: configs/datasets/uct_student.yaml
+  target_formulation: three_class
+
+target:
+  class_order:
+    - Dropout
+    - Enrolled
+    - Graduate
+
+target_mapping_override:
+  three_class:
+    Dropout: 0
+    Enrolled: 1
+    Graduate: 2
+
+splits:
+  test_size: 0.2
+  validation_size: 0.2
+  stratify_column: target
+
+preprocessing:
+  drop_missing_rows: true
+  missing_values:
+    drop_rows: true
+  imputation: median_mode
+  encoding: onehot
+  scaling: standard
+  outlier:
+    enabled: true
+    method: isolation_forest
+    contamination: 0.1
+  balancing:
+    enabled: true
+    method: smote
+    k_neighbors: 5
+
+models:
+  candidates:
+    - svm
+    - gradient_boosting
+    - lightgbm
+    - catboost
+    - xgboost
+  param_overrides:
+    svm:
+      kernel: rbf
+  tuning:
+    backend: optuna
+    n_trials: 10
+    cv_folds: 3
+    scoring: f1_macro
+    objective_source: validation
+
+metrics:
+  primary: macro_f1
+  secondary:
+    - accuracy
+    - weighted_f1
+    - balanced_accuracy
+    - macro_precision
+    - macro_recall
+
+outputs:
+  results_dir: results/exp_bm_uct_3class_paper_push_all
+  runtime_artifact_format: csv
+  mirror_benchmark_outputs_to_runtime: true

@@ -1,0 +1,57 @@
+﻿# UCT / UCI Student dataset configuration.
+# Aligned to article_CSEDU_2026:
+# - UCT/UCI is treated as a 3-class problem: Dropout / Enrolled / Graduate
+# - raw UCI file uses semicolon-separated columns and target column name "Target"
+# - this dataset has no natural student_id column, so entity_id is generated in adapter
+
+dataset:
+  name: uct_student
+  source_format: csv
+
+paths:
+  raw_root: data/raw/uct_student
+  raw_file: data/raw/uct_student/uct_student.csv
+  interim_root: data/interim/uct_student
+  processed_root: data/processed/uct_student
+
+source:
+  filename: uct_student.csv
+  delimiter: ";"
+  encoding: utf-8
+
+schema:
+  entity_id: null
+  term_column: null
+  outcome_column: Target
+
+features:
+  builder: uct_student_features
+  derive_safe_features: true
+  include_groups:
+    - demographics
+    - enrollment
+    - academic_performance
+    - engagement
+
+outputs:
+  features_filename: uct_student_features.parquet
+
+preprocessing:
+  # Optional dataset-specific leakage guards; merged with experiment-level forbidden columns.
+  forbidden_feature_columns: []
+
+target_mappings:
+  binary:
+    Dropout: 1
+    Enrolled: 0
+    Graduate: 0
+
+  three_class:
+    Dropout: 2
+    Enrolled: 1
+    Graduate: 0
+
+  four_class:
+    Dropout: 2
+    Enrolled: 1
+    Graduate: 0
