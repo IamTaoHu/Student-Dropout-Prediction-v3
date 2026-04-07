@@ -1,0 +1,138 @@
+experiment:
+  id: exp_uct_3class_two_stage_v1
+  mode: two_stage
+  seed: 42
+  dataset_config: configs/datasets/uct_student.yaml
+  target_formulation: three_class
+
+target:
+  class_order: [Dropout, Enrolled, Graduate]
+
+target_mapping_override:
+  three_class:
+    Dropout: 0
+    Enrolled: 1
+    Graduate: 2
+
+splits:
+  test_size: 0.20
+  validation_size: 0.20
+  stratify_column: target
+
+preprocessing:
+  drop_missing_rows: true
+  missing_values:
+    drop_rows: true
+  imputation: median_mode
+  encoding: onehot
+  scaling: standard
+  require_onehot_encoding: true
+  outlier:
+    enabled: false
+  balancing:
+    enabled: false
+
+feature_engineering:
+  dataset_features:
+    derive_safe_features: true
+    derive_enrolled_focus_features: true
+
+models:
+  candidates:
+    - svm
+    - lightgbm
+    - catboost
+    - xgboost
+    - random_forest
+    - gradient_boosting
+    - mlp
+    - decision_tree
+  tuning:
+    backend: optuna
+    mode: optuna
+    n_trials: 40
+    cv_folds: 3
+    scoring: macro_f1
+    objective_source: validation
+    objective_metric: macro_f1
+    per_model_n_trials:
+      svm: 15
+      lightgbm: 40
+      catboost: 40
+      xgboost: 30
+      random_forest: 12
+      gradient_boosting: 12
+      mlp: 15
+      decision_tree: 8
+    search_space_overrides:
+      svm:
+        kernel_choices: [linear, rbf]
+        class_weight_choices: [null, balanced]
+        kernel_params:
+          linear:
+            C:
+              low: 1.0e-2
+              high: 10.0
+              log: true
+          rbf:
+            C:
+              low: 1.0e-1
+              high: 30.0
+              log: true
+            gamma:
+              low: 1.0e-4
+              high: 1.0e-1
+              log: true
+  retrain_on_full_train_split: true
+
+evaluation:
+  metrics:
+    - macro_f1
+    - balanced_accuracy
+    - accuracy
+  compare_default_argmax: true
+  decision_rule: model_predict
+  save_confusion_matrix: true
+  save_classification_report: true
+  cross_validation:
+    enabled: true
+    n_splits: 5
+    shuffle: true
+    random_state: 42
+
+selection:
+  primary: enrolled_f1
+  tie_breakers:
+    - macro_f1
+    - balanced_accuracy
+
+two_stage:
+  threshold_stage1: 0.50
+  stage2_positive_class: enrolled
+  threshold_tuning:
+    enabled: false
+  class_weight:
+    stage1:
+      enabled: true
+      strategy: balanced
+    stage2:
+      enabled: true
+      mode: explicit
+      strategy: explicit
+      values:
+        Graduate: 1.0
+        Enrolled: 1.35
+
+metrics:
+  primary: macro_f1
+  secondary:
+    - balanced_accuracy
+    - enrolled_precision
+    - enrolled_f1
+    - enrolled_recall
+
+outputs:
+  results_dir: results/exp_uct_3class_two_stage_v1
+  runtime_artifact_format: csv
+  mirror_benchmark_outputs_to_runtime: true
+  save_artifact_manifest: true

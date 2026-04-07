@@ -22,6 +22,7 @@ class TwoStageUct3ClassClassifier:
     threshold_stage1: float = 0.5
     stage1_positive_label: int = 1
     stage2_positive_label: int = 1
+    stage2_positive_target_label: int | None = None
     class_thresholds: dict[int, float] | None = None
 
     def __post_init__(self) -> None:
@@ -36,6 +37,11 @@ class TwoStageUct3ClassClassifier:
             [int(self.dropout_label), int(self.enrolled_label), int(self.graduate_label)],
             dtype=int,
         )
+        if self.stage2_positive_target_label is None:
+            self.stage2_positive_target_label = int(self.graduate_label)
+        self.stage2_positive_target_label = int(self.stage2_positive_target_label)
+        if self.stage2_positive_target_label not in {int(self.enrolled_label), int(self.graduate_label)}:
+            raise ValueError("stage2_positive_target_label must match enrolled_label or graduate_label.")
         self._class_index = {int(label): idx for idx, label in enumerate(self.classes_)}
         self._class_threshold_vector = self._build_class_threshold_vector(self.class_thresholds)
         # Explainability/figure fallback hook.
@@ -99,13 +105,19 @@ class TwoStageUct3ClassClassifier:
     def _stage2_enrolled_graduate_probability(self, X: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:
         proba = np.asarray(self.stage2_model.predict_proba(X), dtype=float)
         classes = getattr(self.stage2_model, "classes_", None)
-        p_graduate_given_non_dropout = self._resolve_probability_column(
+        p_positive_given_non_dropout = self._resolve_probability_column(
             proba=proba,
             classes=classes,
             positive_label=int(self.stage2_positive_label),
         )
-        p_graduate_given_non_dropout = np.clip(p_graduate_given_non_dropout, 0.0, 1.0)
-        p_enrolled_given_non_dropout = np.clip(1.0 - p_graduate_given_non_dropout, 0.0, 1.0)
+        p_positive_given_non_dropout = np.clip(p_positive_given_non_dropout, 0.0, 1.0)
+        p_negative_given_non_dropout = np.clip(1.0 - p_positive_given_non_dropout, 0.0, 1.0)
+        if int(self.stage2_positive_target_label) == int(self.enrolled_label):
+            p_enrolled_given_non_dropout = p_positive_given_non_dropout
+            p_graduate_given_non_dropout = p_negative_given_non_dropout
+        else:
+            p_enrolled_given_non_dropout = p_negative_given_non_dropout
+            p_graduate_given_non_dropout = p_positive_given_non_dropout
         return p_enrolled_given_non_dropout, p_graduate_given_non_dropout
 
     def _fused_probabilities(self, X_df: pd.DataFrame) -> np.ndarray:

@@ -1950,6 +1950,95 @@ def _resolve_two_stage_calibration_config(two_stage_cfg: dict[str, Any]) -> dict
     }
 
 
+def _resolve_two_stage_stage2_positive_target_label(
+    two_stage_cfg: dict[str, Any],
+    enrolled_idx: int,
+    graduate_idx: int,
+) -> int:
+    raw_value = str(two_stage_cfg.get("stage2_positive_class", "graduate")).strip().lower()
+    if raw_value in {"enrolled", str(enrolled_idx)}:
+        return int(enrolled_idx)
+    if raw_value in {"graduate", str(graduate_idx)}:
+        return int(graduate_idx)
+    raise ValueError("two_stage.stage2_positive_class must be 'enrolled' or 'graduate'.")
+
+
+def _resolve_two_stage_stage_class_weights(
+    two_stage_cfg: dict[str, Any],
+    class_weight_cfg: dict[str, Any],
+    *,
+    dropout_idx: int,
+    enrolled_idx: int,
+    graduate_idx: int,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    stage_cfg_raw = two_stage_cfg.get("class_weight", {})
+    stage_cfg = stage_cfg_raw if isinstance(stage_cfg_raw, dict) else {}
+    stage1_override = stage_cfg.get("stage1", {}) if isinstance(stage_cfg.get("stage1", {}), dict) else {}
+    stage2_override = stage_cfg.get("stage2", {}) if isinstance(stage_cfg.get("stage2", {}), dict) else {}
+
+    requested = _class_weight_requested(class_weight_cfg)
+    base_mode = str(class_weight_cfg.get("mode", class_weight_cfg.get("strategy", "none"))).strip().lower()
+    base_values = class_weight_cfg.get("values", class_weight_cfg.get("class_weight_map", {}))
+    if not isinstance(base_values, dict):
+        base_values = {}
+
+    stage1_cfg: dict[str, Any] = {
+        "enabled": requested,
+        "strategy": "balanced" if requested else "none",
+        "class_label_to_index": {"Non-Dropout": 0, "Dropout": 1},
+    }
+    if requested:
+        stage1_cfg["mode"] = "balanced"
+    if stage1_override:
+        stage1_cfg.update(stage1_override)
+    stage1_cfg["class_label_to_index"] = {"Non-Dropout": 0, "Dropout": 1}
+
+    stage2_cfg: dict[str, Any] = {
+        "enabled": requested,
+        "strategy": "none",
+        "class_label_to_index": {"Graduate": 0, "Enrolled": 1},
+    }
+    if requested:
+        stage2_cfg["mode"] = "balanced"
+        stage2_cfg["strategy"] = "balanced"
+
+    enrolled_weight = float(
+        stage2_override.get(
+            "enrolled_weight",
+            base_values.get("Enrolled", class_weight_cfg.get("enrolled_boost", 1.35)),
+        )
+    )
+    graduate_weight = float(stage2_override.get("graduate_weight", base_values.get("Graduate", 1.0)))
+    if enrolled_weight <= 0.0 or graduate_weight <= 0.0:
+        raise ValueError("two_stage class weights must be positive.")
+
+    if base_mode == "explicit" and requested:
+        stage2_cfg.update(
+            {
+                "enabled": True,
+                "mode": "explicit",
+                "strategy": "explicit",
+                "values": {"Graduate": graduate_weight, "Enrolled": enrolled_weight},
+                "class_weight_map": {"Graduate": graduate_weight, "Enrolled": enrolled_weight},
+            }
+        )
+    elif str(class_weight_cfg.get("strategy", "")).strip().lower() == "enrolled_boost" and requested:
+        stage2_cfg.update(
+            {
+                "enabled": True,
+                "mode": "explicit",
+                "strategy": "explicit",
+                "values": {"Graduate": graduate_weight, "Enrolled": enrolled_weight},
+                "class_weight_map": {"Graduate": graduate_weight, "Enrolled": enrolled_weight},
+            }
+        )
+
+    if stage2_override:
+        stage2_cfg.update(stage2_override)
+    stage2_cfg["class_label_to_index"] = {"Graduate": 0, "Enrolled": 1}
+    return stage1_cfg, stage2_cfg
+
+
 def _resolve_two_stage_threshold_tuning_config(
     two_stage_cfg: dict[str, Any],
     class_metadata: dict[str, Any],
@@ -2274,6 +2363,7 @@ def _run_two_stage_uct_model(
     tuning_cfg: dict[str, Any],
     tuning_enabled: bool,
     retrain_on_full_train_split: bool,
+    two_stage_cfg: dict[str, Any],
     class_weight_cfg: dict[str, Any],
     class_metadata: dict[str, Any],
     X_train: pd.DataFrame,
@@ -2289,6 +2379,11 @@ def _run_two_stage_uct_model(
     output_dir: Path,
 ) -> tuple[dict[str, Any], Any, float | None, dict[str, Any], dict[str, str] | None]:
     dropout_idx, enrolled_idx, graduate_idx = _resolve_uct_three_class_indices(class_metadata)
+    stage2_positive_target_label = _resolve_two_stage_stage2_positive_target_label(
+        two_stage_cfg=two_stage_cfg if isinstance(two_stage_cfg, dict) else {},
+        enrolled_idx=enrolled_idx,
+        graduate_idx=graduate_idx,
+    )
 
     y_train_stage1 = (y_train == dropout_idx).astype(int)
     y_valid_stage1 = (y_valid == dropout_idx).astype(int)
@@ -2301,21 +2396,34 @@ def _run_two_stage_uct_model(
     if int(train_mask_stage2.sum()) == 0:
         raise ValueError("No non-dropout samples available for stage2 training.")
     X_train_stage2 = X_train.loc[train_mask_stage2].reset_index(drop=True)
-    y_train_stage2 = (y_train.loc[train_mask_stage2] == graduate_idx).astype(int).reset_index(drop=True)
     X_valid_stage2 = X_valid.loc[valid_mask_stage2].reset_index(drop=True)
-    y_valid_stage2 = (y_valid.loc[valid_mask_stage2] == graduate_idx).astype(int).reset_index(drop=True)
+    X_test_stage2 = X_test.loc[test_mask_stage2].reset_index(drop=True)
+    if int(stage2_positive_target_label) == int(enrolled_idx):
+        y_train_stage2 = (y_train.loc[train_mask_stage2] == enrolled_idx).astype(int).reset_index(drop=True)
+        y_valid_stage2 = (y_valid.loc[valid_mask_stage2] == enrolled_idx).astype(int).reset_index(drop=True)
+        y_test_stage2 = (y_test.loc[test_mask_stage2] == enrolled_idx).astype(int).reset_index(drop=True)
+        stage2_class_label_to_index = {"Graduate": 0, "Enrolled": 1}
+        stage2_positive_label_name = "Enrolled"
+        stage2_negative_label_name = "Graduate"
+    else:
+        y_train_stage2 = (y_train.loc[train_mask_stage2] == graduate_idx).astype(int).reset_index(drop=True)
+        y_valid_stage2 = (y_valid.loc[valid_mask_stage2] == graduate_idx).astype(int).reset_index(drop=True)
+        y_test_stage2 = (y_test.loc[test_mask_stage2] == graduate_idx).astype(int).reset_index(drop=True)
+        stage2_class_label_to_index = {"Enrolled": 0, "Graduate": 1}
+        stage2_positive_label_name = "Graduate"
+        stage2_negative_label_name = "Enrolled"
 
     if int(pd.Series(y_train_stage2).nunique()) < 2:
         raise ValueError("Stage2 training requires both Enrolled and Graduate classes in train split.")
 
-    stage1_class_weight_cfg = {
-        **(class_weight_cfg if isinstance(class_weight_cfg, dict) else {}),
-        "class_label_to_index": {"Non-Dropout": 0, "Dropout": 1},
-    }
-    stage2_class_weight_cfg = {
-        **(class_weight_cfg if isinstance(class_weight_cfg, dict) else {}),
-        "class_label_to_index": {"Enrolled": 0, "Graduate": 1},
-    }
+    stage1_class_weight_cfg, stage2_class_weight_cfg = _resolve_two_stage_stage_class_weights(
+        two_stage_cfg=two_stage_cfg if isinstance(two_stage_cfg, dict) else {},
+        class_weight_cfg=class_weight_cfg if isinstance(class_weight_cfg, dict) else {},
+        dropout_idx=dropout_idx,
+        enrolled_idx=enrolled_idx,
+        graduate_idx=graduate_idx,
+    )
+    stage2_class_weight_cfg["class_label_to_index"] = stage2_class_label_to_index
 
     params_stage1: dict[str, Any] = dict(params_overrides)
     params_stage2: dict[str, Any] = dict(params_overrides)
@@ -2415,8 +2523,8 @@ def _run_two_stage_uct_model(
             y_train=y_train_stage2,
             X_valid=X_valid_stage2,
             y_valid=y_valid_stage2,
-            X_test=X_test.loc[test_mask_stage2].reset_index(drop=True),
-            y_test=(y_test.loc[test_mask_stage2] == graduate_idx).astype(int).reset_index(drop=True),
+            X_test=X_test_stage2,
+            y_test=y_test_stage2,
             eval_config=eval_cfg_stage2,
         )
         X_stage2_full = pd.concat([X_train_stage2, X_valid_stage2], axis=0).reset_index(drop=True)
@@ -2426,8 +2534,8 @@ def _run_two_stage_uct_model(
             params=params_stage2,
             X_train_full=X_stage2_full,
             y_train_full=y_stage2_full,
-            X_test=X_test.loc[test_mask_stage2].reset_index(drop=True),
-            y_test=(y_test.loc[test_mask_stage2] == graduate_idx).astype(int).reset_index(drop=True),
+            X_test=X_test_stage2,
+            y_test=y_test_stage2,
             eval_config=eval_cfg_stage2,
         )
         for key in ("y_true_valid", "y_pred_valid", "y_proba_valid"):
@@ -2451,8 +2559,8 @@ def _run_two_stage_uct_model(
             y_train=y_train_stage2,
             X_valid=X_valid_stage2,
             y_valid=y_valid_stage2,
-            X_test=X_test.loc[test_mask_stage2].reset_index(drop=True),
-            y_test=(y_test.loc[test_mask_stage2] == graduate_idx).astype(int).reset_index(drop=True),
+            X_test=X_test_stage2,
+            y_test=y_test_stage2,
             eval_config=eval_cfg_stage2,
         )
 
@@ -2491,6 +2599,7 @@ def _run_two_stage_uct_model(
         threshold_stage1=threshold_stage1,
         stage1_positive_label=1,
         stage2_positive_label=1,
+        stage2_positive_target_label=stage2_positive_target_label,
         class_thresholds=class_thresholds,
     )
 
@@ -2613,7 +2722,8 @@ def _run_two_stage_uct_model(
             "stage1_task": "Dropout vs Non-Dropout",
             "stage2_task": "Enrolled vs Graduate",
             "stage1_positive_label": "Dropout",
-            "stage2_positive_label": "Graduate",
+            "stage2_positive_label": stage2_positive_label_name,
+            "stage2_negative_label": stage2_negative_label_name,
             "fusion": {
                 "type": "soft_probability_fusion",
                 "class_order": [int(dropout_idx), int(enrolled_idx), int(graduate_idx)],
@@ -2665,6 +2775,7 @@ def _run_two_stage_uct_model(
             "P(enrolled)": "(1-p_dropout) * p_enrolled_given_non_dropout",
             "P(graduate)": "(1-p_dropout) * p_graduate_given_non_dropout",
         },
+        "stage2_positive_label": stage2_positive_label_name,
     }
     calibration_metadata_payload = {
         "model": model_name,
@@ -3376,9 +3487,11 @@ def run_experiment(experiment_config_path: Path, compact_summary: bool | None = 
     class_weight_cfg = _resolve_class_weight_config(exp_cfg=exp_cfg, class_metadata=class_metadata)
     threshold_tuning_cfg = _resolve_threshold_tuning_config(exp_cfg)
     two_stage_mode_aliases = {
+        "two_stage": "hard_stage1",
+        "hierarchical": "hard_stage1",
         "two_stage_uct_3class": "hard_stage1",
-        "two_stage_uct_3class_soft": "soft_fused",
         "two_stage_soft": "soft_fused",
+        "two_stage_uct_3class_soft": "soft_fused",
     }
     two_stage_decision_mode = two_stage_mode_aliases.get(experiment_mode)
     two_stage_enabled = two_stage_decision_mode is not None
@@ -3508,6 +3621,7 @@ def run_experiment(experiment_config_path: Path, compact_summary: bool | None = 
                     tuning_cfg=model_tuning_cfg,
                     tuning_enabled=model_tuning_enabled,
                     retrain_on_full_train_split=retrain_on_full_train_split,
+                    two_stage_cfg=two_stage_cfg,
                     class_weight_cfg=class_weight_cfg if isinstance(class_weight_cfg, dict) else {},
                     class_metadata=class_metadata,
                     X_train=X_train_bal,
