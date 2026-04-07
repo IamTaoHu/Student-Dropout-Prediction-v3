@@ -28,6 +28,10 @@ Main dependencies include:
 ```bash
 python scripts/build_uct_student_dataset.py --dataset-config configs/datasets/uct_student.yaml
 ```
+Notes:
+- UCT rebuilds from raw CSV (`data/raw/uct_student/uct_student.csv`) through loader -> adapter -> `uct_student_features`.
+- Do not bypass this with direct supervisor parquet ingestion for benchmark training flow.
+- The build script is a reproducible export helper; benchmark runs remain config-driven from dataset config.
 - Build OULAD processed features:
 ```bash
 python scripts/build_oulad_dataset.py --dataset-config configs/datasets/oulad.yaml

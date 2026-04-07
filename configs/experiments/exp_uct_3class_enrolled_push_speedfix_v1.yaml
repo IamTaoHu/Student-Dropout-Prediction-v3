@@ -1,0 +1,146 @@
+experiment:
+  id: exp_uct_3class_enrolled_push_speedfix_v1
+  mode: benchmark
+  seed: 42
+  dataset_config: configs/datasets/uct_student.yaml
+  target_formulation: three_class
+
+target:
+  class_order: [Dropout, Enrolled, Graduate]
+
+target_mapping_override:
+  three_class:
+    Dropout: 0
+    Enrolled: 1
+    Graduate: 2
+
+splits:
+  test_size: 0.20
+  validation_size: 0.20
+  stratify_column: target
+
+preprocessing:
+  drop_missing_rows: true
+  missing_values:
+    drop_rows: true
+  imputation: median_mode
+  encoding: onehot
+  scaling: standard
+  require_onehot_encoding: true
+  outlier:
+    enabled: false
+  balancing:
+    enabled: false
+
+training:
+  class_weight:
+    mode: explicit
+    values:
+      Dropout: 1.0
+      Enrolled: 1.35
+      Graduate: 1.0
+
+models:
+  candidates:
+    - svm
+    - lightgbm
+    - catboost
+    - xgboost
+    - random_forest
+    - gradient_boosting
+    - mlp
+    - decision_tree
+  tuning:
+    backend: optuna
+    mode: optuna
+    n_trials: 40
+    cv_folds: 3
+    scoring: macro_f1
+    objective_source: validation
+    per_model_n_trials:
+      svm: 24
+      lightgbm: 40
+      catboost: 40
+      xgboost: 40
+      random_forest: 15
+      gradient_boosting: 15
+      mlp: 25
+      decision_tree: 10
+    search_space_overrides:
+      svm:
+        kernel_choices: [linear, rbf]
+        class_weight_choices: [null, balanced]
+        kernel_params:
+          linear:
+            C:
+              low: 1.0e-2
+              high: 10.0
+              log: true
+          rbf:
+            C:
+              low: 1.0e-1
+              high: 30.0
+              log: true
+            gamma:
+              low: 1.0e-4
+              high: 1.0e-1
+              log: true
+  retrain_on_full_train_split: true
+
+evaluation:
+  metrics:
+    - macro_f1
+    - balanced_accuracy
+    - accuracy
+  compare_default_argmax: true
+  decision_rule: argmax
+  save_confusion_matrix: true
+  save_classification_report: true
+  cross_validation:
+    enabled: true
+    n_splits: 5
+    shuffle: true
+    random_state: 42
+
+selection:
+  primary: macro_f1
+  tie_breakers:
+    - enrolled_f1
+    - enrolled_recall
+    - balanced_accuracy
+
+inference:
+  multiclass_decision:
+    enabled: true
+    strategy: enrolled_push
+    enrolled_class_name: Enrolled
+    fallback: argmax
+    enrolled_probability_threshold:
+      enabled: true
+      value: 0.40
+    enrolled_middle_band:
+      enabled: true
+      min_enrolled_prob: 0.30
+      max_top2_gap: 0.05
+    auto_tune:
+      enabled: true
+      objective: enrolled_f1
+      split: validation
+      search:
+        method: grid
+        enrolled_probability_thresholds: [0.35, 0.40, 0.45]
+        min_enrolled_probs: [0.30, 0.35]
+        max_top2_gaps: [0.05, 0.08]
+
+metrics:
+  primary: macro_f1
+  secondary:
+    - balanced_accuracy
+    - enrolled_f1
+    - enrolled_recall
+
+outputs:
+  results_dir: results/exp_uct_3class_enrolled_push_speedfix_v1
+  runtime_artifact_format: csv
+  mirror_benchmark_outputs_to_runtime: true
+  save_artifact_manifest: true

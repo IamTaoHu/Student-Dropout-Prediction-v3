@@ -272,6 +272,91 @@ class SmokeBenchmarkTests(unittest.TestCase):
             self.assertTrue((runtime_dir / "artifact_manifest.json").exists())
             self.assertTrue((runtime_dir / "confusion_matrix_decision_tree.png").exists())
 
+    def test_multi_model_single_folder_outputs_are_aggregated(self) -> None:
+        try:
+            import yaml
+        except Exception:
+            self.skipTest("PyYAML is not installed in this environment.")
+        rng = np.random.default_rng(999)
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_dir = Path(tmp)
+            raw_csv = tmp_dir / "uct_student_agg.csv"
+            results_dir = tmp_dir / "results_single_bundle"
+
+            rows = 150
+            outcomes = np.array(["Dropout", "Enrolled", "Graduate"])
+            df = pd.DataFrame(
+                {
+                    "student_id": np.arange(rows),
+                    "feature_num": rng.normal(size=rows),
+                    "feature_cat": np.where(rng.random(rows) > 0.5, "A", "B"),
+                    "Target": outcomes[np.arange(rows) % 3],
+                }
+            )
+            df.to_csv(raw_csv, sep=";", index=False)
+
+            dataset_cfg = {
+                "dataset": {"name": "uct_student", "source_format": "csv"},
+                "paths": {"raw_file": str(raw_csv)},
+                "source": {"delimiter": ";", "encoding": "utf-8"},
+                "schema": {"entity_id": "student_id", "outcome_column": "Target"},
+                "features": {"derive_safe_features": True},
+                "target_mappings": {
+                    "three_class": {"Dropout": 0, "Enrolled": 1, "Graduate": 2},
+                },
+            }
+            dataset_cfg_path = tmp_dir / "dataset_agg.yaml"
+            dataset_cfg_path.write_text(yaml.safe_dump(dataset_cfg), encoding="utf-8")
+
+            exp_cfg = {
+                "experiment": {
+                    "id": "smoke_exp_uct_agg",
+                    "seed": 42,
+                    "dataset_config": str(dataset_cfg_path),
+                    "target_formulation": "three_class",
+                },
+                "target": {"class_order": ["Dropout", "Enrolled", "Graduate"]},
+                "target_mapping_override": {
+                    "three_class": {"Dropout": 0, "Enrolled": 1, "Graduate": 2},
+                },
+                "splits": {"test_size": 0.2, "validation_size": 0.2, "stratify_column": "target"},
+                "preprocessing": {
+                    "drop_missing_rows": True,
+                    "missing_values": {"drop_rows": True},
+                    "imputation": "median_mode",
+                    "encoding": "onehot",
+                    "scaling": "standard",
+                    "outlier": {"enabled": False},
+                    "balancing": {"enabled": False},
+                },
+                "models": {
+                    "candidates": ["decision_tree", "gradient_boosting"],
+                    "tuning": {"backend": "none", "n_trials": 0},
+                },
+                "metrics": {"primary": "macro_f1"},
+                "outputs": {
+                    "results_dir": str(results_dir),
+                    "runtime_artifact_format": "csv",
+                    "mirror_benchmark_outputs_to_runtime": True,
+                },
+            }
+            exp_cfg_path = tmp_dir / "experiment_agg.yaml"
+            exp_cfg_path.write_text(yaml.safe_dump(exp_cfg), encoding="utf-8")
+
+            summary = run_experiment(exp_cfg_path)
+            self.assertTrue((results_dir / "benchmark_summary.json").exists())
+            self.assertTrue((results_dir / "benchmark_summary.md").exists())
+            self.assertTrue((results_dir / "leaderboard.csv").exists())
+            self.assertTrue((results_dir / "metrics.json").exists())
+            self.assertTrue((results_dir / "predictions.csv").exists())
+            self.assertTrue((results_dir / "artifact_manifest.json").exists())
+
+            leaderboard = pd.read_csv(results_dir / "leaderboard.csv")
+            self.assertSetEqual(set(leaderboard["model"].astype(str).tolist()), {"decision_tree", "gradient_boosting"})
+            self.assertEqual(len(summary.get("leaderboard", [])), 2)
+            self.assertTrue((results_dir / "confusion_matrix_decision_tree.png").exists())
+            self.assertTrue((results_dir / "confusion_matrix_gradient_boosting.png").exists())
+
 
 if __name__ == "__main__":
     unittest.main()

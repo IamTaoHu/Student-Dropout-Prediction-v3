@@ -95,6 +95,8 @@ def plot_learning_curve(
 
 
 def _is_tree_model_for_shap(model: Any) -> bool:
+    if hasattr(model, "explainability_model"):
+        model = getattr(model, "explainability_model")
     module_name = model.__class__.__module__.lower()
     class_name = model.__class__.__name__.lower()
     return any(token in f"{module_name}.{class_name}" for token in ["xgb", "lgbm", "catboost"])
@@ -331,6 +333,7 @@ def generate_all_figures(
     include_status: bool = False,
 ) -> dict[str, Any]:
     """Generate required visualization set for one experiment run."""
+    effective_model = getattr(model, "explainability_model", model)
     root = Path(output_dir)
     figures_dir = root / "figures"
     figures_dir.mkdir(parents=True, exist_ok=True)
@@ -340,7 +343,7 @@ def generate_all_figures(
 
     try:
         lc_path = plot_learning_curve(
-            model=model,
+            model=effective_model,
             X_train=X_train,
             y_train=y_train,
             output_path=figures_dir / "learning_curve.png",
@@ -415,7 +418,7 @@ def generate_all_figures(
     else:
         try:
             beeswarm_path = plot_shap_beeswarm(
-                model=model,
+                model=effective_model,
                 X_test=X_test,
                 y_test=y_test,
                 output_path=figures_dir / "shap_beeswarm.png",
@@ -447,7 +450,7 @@ def generate_all_figures(
 
         try:
             waterfall_paths = plot_shap_waterfall(
-                model=model,
+                model=effective_model,
                 X_test=X_test,
                 y_test=y_test,
                 output_dir=figures_dir,

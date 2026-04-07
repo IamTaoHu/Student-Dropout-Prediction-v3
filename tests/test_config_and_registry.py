@@ -56,6 +56,14 @@ class ConfigAndRegistryTests(unittest.TestCase):
                 normalized = alias_map.get(str(model_name), str(model_name).removesuffix("_optuna"))
                 self.assertIn(normalized, available, msg=f"{path.name} uses unknown model '{model_name}'")
 
+    def test_uct_paper_push_is_single_bundled_entrypoint(self) -> None:
+        exp_dir = Path("configs/experiments")
+        remaining = sorted(exp_dir.glob("exp_bm_uct_3class_paper_push*.yaml"))
+        self.assertEqual(
+            [p.name for p in remaining],
+            ["exp_bm_uct_3class_paper_push_all.yaml"],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

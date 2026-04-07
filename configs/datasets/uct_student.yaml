@@ -9,6 +9,7 @@ dataset:
   source_format: csv
 
 paths:
+  # UCT workflow should rebuild from raw CSV through loader -> adapter -> feature_builder.
   raw_root: data/raw/uct_student
   raw_file: data/raw/uct_student/uct_student.csv
   interim_root: data/interim/uct_student
@@ -34,6 +35,7 @@ features:
     - engagement
 
 outputs:
+  # Export helper artifact only; experiments continue to read raw CSV via dataset config.
   features_filename: uct_student_features.parquet
 
 preprocessing:

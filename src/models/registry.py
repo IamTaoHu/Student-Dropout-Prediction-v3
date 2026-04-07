@@ -6,6 +6,7 @@ from collections.abc import Callable
 from typing import Any
 
 from sklearn.ensemble import GradientBoostingClassifier, RandomForestClassifier
+from sklearn.neural_network import MLPClassifier
 from sklearn.svm import SVC
 from sklearn.tree import DecisionTreeClassifier
 
@@ -59,6 +60,10 @@ def _catboost_factory(params: dict[str, Any]) -> Any:
     return CatBoostClassifier(**payload)
 
 
+def _mlp_factory(params: dict[str, Any]) -> Any:
+    return MLPClassifier(**params)
+
+
 MODEL_REGISTRY: dict[str, ModelFactory] = {
     "decision_tree": _decision_tree_factory,
     "random_forest": _random_forest_factory,
@@ -67,6 +72,7 @@ MODEL_REGISTRY: dict[str, ModelFactory] = {
     "xgboost": _xgboost_factory,
     "lightgbm": _lightgbm_factory,
     "catboost": _catboost_factory,
+    "mlp": _mlp_factory,
 }
 
 

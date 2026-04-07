@@ -31,6 +31,9 @@ def _save_leaderboard_csv(summary: dict[str, Any], output_dir: Path) -> Path:
         leaderboard = pd.DataFrame(rows)
     leaderboard_path = output_dir / "leaderboard.csv"
     leaderboard.to_csv(leaderboard_path, index=False)
+    # Backward-compatible alias used by some downstream analysis notebooks.
+    summary_csv_path = output_dir / "summary.csv"
+    leaderboard.to_csv(summary_csv_path, index=False)
     return leaderboard_path
 
 
@@ -49,6 +52,51 @@ def _save_markdown_summary(summary: dict[str, Any], leaderboard: pd.DataFrame, o
         "",
         leaderboard.to_markdown(index=False) if not leaderboard.empty else "_No model results available._",
     ]
+    mechanism_audit = summary.get("model_mechanism_audit", {})
+    if isinstance(mechanism_audit, dict) and mechanism_audit:
+        rows: list[dict[str, Any]] = []
+        for model_name, payload in mechanism_audit.items():
+            if not isinstance(payload, dict):
+                continue
+            rows.append(
+                {
+                    "model": model_name,
+                    "class_weight_requested": payload.get("class_weight_requested"),
+                    "class_weight_supported": payload.get("class_weight_supported"),
+                    "class_weight_applied": payload.get("class_weight_applied"),
+                    "class_weight_effective": payload.get("class_weight_effective"),
+                    "threshold_tuning_requested": payload.get("threshold_tuning_requested"),
+                    "threshold_tuning_supported": payload.get("threshold_tuning_supported"),
+                    "threshold_tuning_applied": payload.get("threshold_tuning_applied"),
+                    "threshold_selection_split": payload.get("threshold_selection_split"),
+                    "selected_thresholds": json.dumps(payload.get("selected_thresholds", {})),
+                }
+            )
+        if rows:
+            audit_df = pd.DataFrame(rows)
+            lines.extend(
+                [
+                    "",
+                    "## Mechanism Audit",
+                    "",
+                    audit_df.to_markdown(index=False),
+                ]
+            )
+
+    threshold_cfg = summary.get("threshold_tuning", {})
+    if isinstance(threshold_cfg, dict):
+        lines.extend(
+            [
+                "",
+                "## Threshold Tuning Config",
+                "",
+                f"- Enabled: `{bool(threshold_cfg.get('enabled', False))}`",
+                f"- Objective: `{threshold_cfg.get('objective', 'macro_f1')}`",
+                f"- Focus class: `{threshold_cfg.get('focus_class', 'Enrolled')}`",
+                f"- Selection split: `validation`",
+                f"- Applied to: `test`",
+            ]
+        )
     md_path.write_text("\n".join(lines), encoding="utf-8")
     return md_path
 

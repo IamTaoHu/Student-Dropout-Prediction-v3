@@ -54,6 +54,12 @@ def adapt_uct_student_schema(
         raise TypeError("raw_tables must be a DataFrame or dict[str, pd.DataFrame].")
 
     # Normalize all raw column names.
+    # Important examples for downstream UCT feature engineering:
+    # - "Curricular units 1st sem (approved)" -> "curricular_units_1st_sem_approved"
+    # - "Curricular units 2nd sem (enrolled)" -> "curricular_units_2nd_sem_enrolled"
+    # - "Curricular units 1st sem (evaluations)" -> "curricular_units_1st_sem_evaluations"
+    # - "Curricular units 2nd sem (without evaluations)" -> "curricular_units_2nd_sem_without_evaluations"
+    # - "Curricular units 1st sem (grade)" -> "curricular_units_1st_sem_grade"
     rename_map = {col: _to_snake_case(col) for col in df.columns}
     df = df.rename(columns=rename_map)
 
