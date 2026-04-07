@@ -27,8 +27,20 @@ class TwoStageUct3ClassClassifier:
 
     def __post_init__(self) -> None:
         mode = str(self.decision_mode).strip().lower()
-        if mode not in {"soft_fused", "hard_stage1"}:
-            raise ValueError("decision_mode must be one of: soft_fused, hard_stage1.")
+        alias_map = {
+            "soft_fused": "soft_fused",
+            "hard_stage1": "hard_routing",
+            "hard_routing": "hard_routing",
+            "soft_fusion": "soft_fusion_with_dropout_threshold",
+            "soft_fusion_with_dropout_threshold": "soft_fusion_with_dropout_threshold",
+            "pure_soft_argmax": "pure_soft_argmax",
+        }
+        if mode not in alias_map:
+            raise ValueError(
+                "decision_mode must be one of: soft_fused, hard_stage1, hard_routing, "
+                "soft_fusion, soft_fusion_with_dropout_threshold, pure_soft_argmax."
+            )
+        mode = alias_map[mode]
         self.decision_mode = mode
         if self.threshold_stage1 < 0.0 or self.threshold_stage1 > 1.0:
             raise ValueError("threshold_stage1 must be within [0.0, 1.0].")
@@ -151,12 +163,67 @@ class TwoStageUct3ClassClassifier:
         X_df = self._as_dataframe(X)
         return self._fused_probabilities(X_df)
 
+    def predict_stage_probabilities(
+        self,
+        X: pd.DataFrame | np.ndarray | list[list[float]],
+    ) -> dict[str, np.ndarray]:
+        X_df = self._as_dataframe(X)
+        p_dropout = self._stage1_dropout_probability(X_df)
+        p_non_dropout = np.clip(1.0 - p_dropout, 0.0, 1.0)
+        p_enrolled_given_non_dropout, p_graduate_given_non_dropout = self._stage2_enrolled_graduate_probability(X_df)
+        return {
+            "stage1_prob_dropout": p_dropout,
+            "stage1_prob_non_dropout": p_non_dropout,
+            "stage2_prob_enrolled": p_enrolled_given_non_dropout,
+            "stage2_prob_graduate": p_graduate_given_non_dropout,
+        }
+
     def _predict_soft_thresholded(self, fused_proba: np.ndarray) -> np.ndarray:
         return self.predict_from_fused_probabilities(
             fused_proba=fused_proba,
             classes=self.classes_,
             thresholds=self._class_threshold_vector,
         )
+
+    @staticmethod
+    def predict_with_dropout_threshold_from_fused_probabilities(
+        fused_proba: np.ndarray,
+        classes: np.ndarray,
+        *,
+        dropout_label: int,
+        enrolled_label: int,
+        graduate_label: int,
+        dropout_threshold: float,
+    ) -> np.ndarray:
+        if fused_proba.ndim != 2:
+            raise ValueError(f"Expected fused_proba with 2 dimensions, got shape={fused_proba.shape}.")
+        if fused_proba.shape[1] != 3:
+            raise ValueError("Dropout-threshold prediction requires 3 fused probability columns.")
+        if dropout_threshold < 0.0 or dropout_threshold > 1.0:
+            raise ValueError("dropout_threshold must be within [0.0, 1.0].")
+
+        classes_arr = np.asarray(classes, dtype=int)
+        class_to_index = {int(label): idx for idx, label in enumerate(classes_arr.tolist())}
+        try:
+            dropout_idx = class_to_index[int(dropout_label)]
+            enrolled_idx = class_to_index[int(enrolled_label)]
+            graduate_idx = class_to_index[int(graduate_label)]
+        except KeyError as exc:
+            raise ValueError("classes must include dropout, enrolled, and graduate labels.") from exc
+
+        preds = np.empty(fused_proba.shape[0], dtype=int)
+        p_dropout = fused_proba[:, dropout_idx]
+        p_enrolled = fused_proba[:, enrolled_idx]
+        p_graduate = fused_proba[:, graduate_idx]
+        # Threshold override is deliberate: gate dropout first, then choose within non-dropout classes.
+        dropout_mask = p_dropout >= float(dropout_threshold)
+        preds[dropout_mask] = int(dropout_label)
+        preds[~dropout_mask] = np.where(
+            p_enrolled[~dropout_mask] >= p_graduate[~dropout_mask],
+            int(enrolled_label),
+            int(graduate_label),
+        )
+        return preds
 
     @staticmethod
     def predict_from_fused_probabilities(
@@ -198,7 +265,7 @@ class TwoStageUct3ClassClassifier:
 
     def predict(self, X: pd.DataFrame | np.ndarray | list[list[float]]) -> np.ndarray:
         X_df = self._as_dataframe(X)
-        if self.decision_mode == "hard_stage1":
+        if self.decision_mode == "hard_routing":
             p_dropout = self._stage1_dropout_probability(X_df)
             p_enrolled_given_non_dropout, p_graduate_given_non_dropout = self._stage2_enrolled_graduate_probability(X_df)
             mapped_stage2 = np.where(
@@ -213,4 +280,16 @@ class TwoStageUct3ClassClassifier:
             ).astype(int)
 
         fused_proba = self.predict_proba(X_df)
+        if self.decision_mode == "soft_fusion_with_dropout_threshold":
+            return self.predict_with_dropout_threshold_from_fused_probabilities(
+                fused_proba=fused_proba,
+                classes=self.classes_,
+                dropout_label=int(self.dropout_label),
+                enrolled_label=int(self.enrolled_label),
+                graduate_label=int(self.graduate_label),
+                dropout_threshold=float(self.threshold_stage1),
+            ).astype(int)
+        if self.decision_mode == "pure_soft_argmax":
+            pred_idx = np.argmax(fused_proba, axis=1)
+            return self.classes_[pred_idx].astype(int)
         return self._predict_soft_thresholded(fused_proba).astype(int)

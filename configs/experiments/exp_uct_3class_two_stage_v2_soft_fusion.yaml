@@ -1,0 +1,135 @@
+experiment:
+  id: exp_uct_3class_two_stage_v2_soft_fusion
+  mode: two_stage
+  seed: 42
+  dataset_config: configs/datasets/uct_student.yaml
+  target_formulation: three_class
+
+pipeline:
+  task_type: two_stage_multiclass
+  final_classes: [dropout, enrolled, graduate]
+
+target:
+  class_order: [Dropout, Enrolled, Graduate]
+
+target_mapping_override:
+  three_class:
+    Dropout: 0
+    Enrolled: 1
+    Graduate: 2
+
+splits:
+  test_size: 0.20
+  validation_size: 0.20
+  stratify_column: target
+
+preprocessing:
+  drop_missing_rows: true
+  missing_values:
+    drop_rows: true
+  imputation: median_mode
+  encoding: onehot
+  scaling: standard
+  require_onehot_encoding: true
+  outlier:
+    enabled: true
+    method: isolation_forest
+  balancing:
+    enabled: true
+    method: smote
+
+feature_engineering:
+  dataset_features:
+    derive_safe_features: true
+
+models:
+  candidates:
+    - decision_tree
+    - random_forest
+    - svm
+    - gradient_boosting
+    - xgboost
+    - lightgbm
+    - catboost
+  tuning:
+    backend: optuna
+    n_trials: 20
+    cv_folds: 3
+    scoring: macro_f1
+    objective_source: validation
+    objective_metric: macro_f1
+    per_model_n_trials:
+      decision_tree: 8
+      random_forest: 12
+      svm: 12
+      gradient_boosting: 12
+      xgboost: 20
+      lightgbm: 20
+      catboost: 20
+  retrain_on_full_train_split: true
+
+evaluation:
+  metrics:
+    - accuracy
+    - macro_f1
+    - weighted_f1
+    - balanced_accuracy
+    - macro_precision
+    - macro_recall
+  compare_default_argmax: true
+  decision_rule: model_predict
+  save_confusion_matrix: true
+  save_classification_report: true
+  cross_validation:
+    enabled: true
+    n_splits: 5
+    shuffle: true
+    random_state: 42
+
+selection:
+  primary: macro_f1
+  tie_breakers:
+    - balanced_accuracy
+    - accuracy
+
+metrics:
+  primary: macro_f1
+  secondary:
+    - accuracy
+    - weighted_f1
+    - balanced_accuracy
+    - macro_precision
+    - macro_recall
+
+two_stage:
+  enabled: true
+  stage1:
+    name: dropout_vs_non_dropout
+    positive_class: dropout
+    negative_group: [enrolled, graduate]
+    threshold_mode: tune
+    dropout_threshold: 0.50
+    threshold_grid: [0.35, 0.40, 0.45, 0.50, 0.55, 0.60, 0.65]
+  stage2:
+    name: enrolled_vs_graduate
+    classes: [enrolled, graduate]
+  final_decision:
+    mode: soft_fusion_with_dropout_threshold
+  stage2_positive_class: enrolled
+  class_weight:
+    stage1:
+      enabled: true
+      strategy: balanced
+    stage2:
+      enabled: true
+      mode: explicit
+      strategy: explicit
+      values:
+        Graduate: 1.0
+        Enrolled: 1.35
+
+outputs:
+  results_dir: results/exp_uct_3class_two_stage_v2_soft_fusion
+  runtime_artifact_format: csv
+  mirror_benchmark_outputs_to_runtime: true
+  save_artifact_manifest: true

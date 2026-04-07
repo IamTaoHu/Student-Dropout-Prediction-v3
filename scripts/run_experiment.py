@@ -379,6 +379,7 @@ def _persist_required_contract_outputs(
             y_proba=y_proba,
             labels=labels,
             class_metadata=class_metadata,
+            extra_columns=best_artifacts.get("prediction_export_test"),
         )
     else:
         pred_df = pd.DataFrame({"y_true": y_test.reset_index(drop=True)})
@@ -481,8 +482,25 @@ def _persist_per_model_run_outputs(
                 y_proba=artifacts.get("y_proba_test"),
                 labels=artifacts.get("labels"),
                 class_metadata=class_metadata,
+                extra_columns=artifacts.get("prediction_export_test"),
             )
             prediction_df.to_csv(model_dir / "predictions.csv", index=False)
+
+        for key, filename in (
+            ("stage1_metrics", "stage1_metrics.json"),
+            ("stage2_metrics", "stage2_metrics.json"),
+            ("two_stage_diagnostics", "two_stage_diagnostics.json"),
+        ):
+            extra_payload = artifacts.get(key)
+            if isinstance(extra_payload, dict) and extra_payload:
+                (model_dir / filename).write_text(json.dumps(extra_payload, indent=2), encoding="utf-8")
+
+        threshold_rows = artifacts.get("threshold_tuning_results")
+        if threshold_rows:
+            pd.DataFrame(threshold_rows).to_csv(model_dir / "threshold_tuning_results.csv", index=False)
+        selected_threshold = artifacts.get("selected_threshold")
+        if isinstance(selected_threshold, dict) and selected_threshold:
+            (model_dir / "selected_threshold.json").write_text(json.dumps(selected_threshold, indent=2), encoding="utf-8")
 
         cv_payload = payload.get("cv_results")
         if isinstance(cv_payload, dict) and cv_payload:
@@ -1018,12 +1036,26 @@ def _build_prediction_export_dataframe(
     y_proba: Any,
     labels: list[Any] | None,
     class_metadata: dict[str, Any] | None = None,
+    extra_columns: dict[str, Any] | pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     df = pd.DataFrame({"y_true": y_true.reset_index(drop=True)})
     if y_pred is not None:
         df["y_pred"] = np.asarray(y_pred)
 
+    index_to_label = (
+        (class_metadata or {}).get("class_index_to_label", {})
+        if isinstance(class_metadata, dict)
+        else {}
+    )
+    if index_to_label:
+        df["true_label"] = df["y_true"].map(lambda value: index_to_label.get(str(int(value)), value))
+        if "y_pred" in df.columns:
+            df["pred_label"] = df["y_pred"].map(lambda value: index_to_label.get(str(int(value)), value))
+
     if y_proba is None:
+        if extra_columns is not None:
+            extra_df = extra_columns if isinstance(extra_columns, pd.DataFrame) else pd.DataFrame(extra_columns)
+            df = pd.concat([df, extra_df.reset_index(drop=True)], axis=1)
         return df
     probs = np.asarray(y_proba, dtype=float)
     if probs.ndim != 2:
@@ -1038,11 +1070,6 @@ def _build_prediction_export_dataframe(
             f"n_labels={len(ordered_labels)}, proba_shape={probs.shape}."
         )
 
-    index_to_label = (
-        (class_metadata or {}).get("class_index_to_label", {})
-        if isinstance(class_metadata, dict)
-        else {}
-    )
     for idx in range(probs.shape[1]):
         class_idx = ordered_labels[idx] if idx < len(ordered_labels) else idx
         label_name = index_to_label.get(str(class_idx), class_idx)
@@ -1050,6 +1077,9 @@ def _build_prediction_export_dataframe(
         df[f"proba_class_{class_idx}"] = probs[:, idx]
         if token:
             df[f"prob_{token}"] = probs[:, idx]
+    if extra_columns is not None:
+        extra_df = extra_columns if isinstance(extra_columns, pd.DataFrame) else pd.DataFrame(extra_columns)
+        df = pd.concat([df, extra_df.reset_index(drop=True)], axis=1)
     return df
 
 
@@ -2114,6 +2144,73 @@ def _resolve_two_stage_threshold_tuning_config(
     }
 
 
+def _resolve_two_stage_stage1_dropout_threshold_config(two_stage_cfg: dict[str, Any]) -> dict[str, Any]:
+    stage1_cfg = two_stage_cfg.get("stage1", {}) if isinstance(two_stage_cfg.get("stage1", {}), dict) else {}
+    tuning_cfg = (
+        two_stage_cfg.get("threshold_tuning", {})
+        if isinstance(two_stage_cfg.get("threshold_tuning", {}), dict)
+        else {}
+    )
+    threshold_mode = str(stage1_cfg.get("threshold_mode", "")).strip().lower()
+    if not threshold_mode:
+        threshold_mode = "tune" if bool(tuning_cfg.get("enabled", False)) else "fixed"
+    if threshold_mode not in {"fixed", "tune"}:
+        raise ValueError("two_stage.stage1.threshold_mode must be 'fixed' or 'tune'.")
+
+    raw_threshold = stage1_cfg.get("dropout_threshold", two_stage_cfg.get("threshold_stage1", 0.5))
+    dropout_threshold = float(raw_threshold)
+    if dropout_threshold < 0.0 or dropout_threshold > 1.0:
+        raise ValueError("two_stage.stage1.dropout_threshold must be within [0.0, 1.0].")
+
+    raw_grid = stage1_cfg.get("threshold_grid", tuning_cfg.get("threshold_grid", [0.35, 0.40, 0.45, 0.50, 0.55, 0.60, 0.65]))
+    if not isinstance(raw_grid, list) or len(raw_grid) == 0:
+        raise ValueError("two_stage.stage1.threshold_grid must be a non-empty list.")
+    threshold_grid = sorted({float(v) for v in raw_grid})
+    for value in threshold_grid:
+        if value < 0.0 or value > 1.0:
+            raise ValueError("two_stage.stage1.threshold_grid values must be within [0.0, 1.0].")
+
+    return {
+        "mode": threshold_mode,
+        "enabled": bool(threshold_mode == "tune"),
+        "metric": "macro_f1",
+        "selection_split": "validation",
+        "dropout_threshold": float(dropout_threshold),
+        "threshold_grid": threshold_grid,
+    }
+
+
+def _resolve_two_stage_decision_mode(experiment_mode: str, two_stage_cfg: dict[str, Any]) -> str | None:
+    final_cfg = (
+        two_stage_cfg.get("final_decision", {})
+        if isinstance(two_stage_cfg.get("final_decision", {}), dict)
+        else {}
+    )
+    requested_mode = str(final_cfg.get("mode", "")).strip().lower()
+    final_mode_aliases = {
+        "hard_routing": "hard_routing",
+        "soft_fusion": "soft_fusion_with_dropout_threshold",
+        "soft_fusion_with_dropout_threshold": "soft_fusion_with_dropout_threshold",
+        "pure_soft_argmax": "pure_soft_argmax",
+    }
+    if requested_mode:
+        if requested_mode not in final_mode_aliases:
+            raise ValueError(
+                "two_stage.final_decision.mode must be one of: "
+                "hard_routing, soft_fusion, soft_fusion_with_dropout_threshold, pure_soft_argmax."
+            )
+        return final_mode_aliases[requested_mode]
+
+    two_stage_mode_aliases = {
+        "two_stage": "hard_routing",
+        "hierarchical": "hard_routing",
+        "two_stage_uct_3class": "hard_routing",
+        "two_stage_soft": "soft_fused",
+        "two_stage_uct_3class_soft": "soft_fused",
+    }
+    return two_stage_mode_aliases.get(experiment_mode)
+
+
 def _threshold_vector_from_map(labels: list[int], thresholds_map: dict[int, float] | None) -> np.ndarray:
     out = np.zeros(len(labels), dtype=float)
     if not thresholds_map:
@@ -2128,6 +2225,149 @@ def _threshold_vector_from_map(labels: list[int], thresholds_map: dict[int, floa
             raise ValueError("threshold values must be within [0.0, 1.0].")
         out[idx] = value
     return out
+
+
+def _predict_two_stage_from_fused_probabilities(
+    fused_proba: np.ndarray,
+    labels: list[int],
+    *,
+    decision_mode: str,
+    dropout_idx: int,
+    enrolled_idx: int,
+    graduate_idx: int,
+    dropout_threshold: float,
+    class_thresholds: dict[int, float] | None = None,
+) -> np.ndarray:
+    label_arr = np.asarray([int(v) for v in labels], dtype=int)
+    mode = str(decision_mode).strip().lower()
+    if mode == "soft_fusion_with_dropout_threshold":
+        return TwoStageUct3ClassClassifier.predict_with_dropout_threshold_from_fused_probabilities(
+            fused_proba=np.asarray(fused_proba, dtype=float),
+            classes=label_arr,
+            dropout_label=int(dropout_idx),
+            enrolled_label=int(enrolled_idx),
+            graduate_label=int(graduate_idx),
+            dropout_threshold=float(dropout_threshold),
+        )
+    if mode == "pure_soft_argmax":
+        pred_idx = np.argmax(np.asarray(fused_proba, dtype=float), axis=1)
+        return label_arr[pred_idx]
+    thresholds_vec = _threshold_vector_from_map(labels, class_thresholds or {})
+    return TwoStageUct3ClassClassifier.predict_from_fused_probabilities(
+        fused_proba=np.asarray(fused_proba, dtype=float),
+        classes=label_arr,
+        thresholds=thresholds_vec,
+    )
+
+
+def _tune_two_stage_dropout_threshold(
+    y_true_valid: pd.Series,
+    y_proba_valid: np.ndarray,
+    labels: list[int],
+    *,
+    dropout_idx: int,
+    enrolled_idx: int,
+    graduate_idx: int,
+    threshold_cfg: dict[str, Any],
+    class_metadata: dict[str, Any],
+) -> dict[str, Any]:
+    label_order = [int(v) for v in labels]
+    proba_valid = np.asarray(y_proba_valid, dtype=float)
+    if proba_valid.ndim != 2 or proba_valid.shape[1] != len(label_order):
+        raise ValueError("Invalid fused probability shape for two-stage dropout-threshold tuning.")
+    y_valid_arr = np.asarray(y_true_valid, dtype=int)
+
+    default_threshold = float(threshold_cfg.get("dropout_threshold", 0.5))
+    baseline_pred = _predict_two_stage_from_fused_probabilities(
+        fused_proba=proba_valid,
+        labels=label_order,
+        decision_mode="soft_fusion_with_dropout_threshold",
+        dropout_idx=dropout_idx,
+        enrolled_idx=enrolled_idx,
+        graduate_idx=graduate_idx,
+        dropout_threshold=default_threshold,
+    )
+    baseline_metrics = compute_metrics(pd.Series(y_valid_arr), baseline_pred)
+    baseline_per_class = compute_per_class_metrics(pd.Series(y_valid_arr), baseline_pred, labels=label_order)
+
+    candidates = [default_threshold]
+    if bool(threshold_cfg.get("enabled", False)):
+        candidates = [float(v) for v in threshold_cfg.get("threshold_grid", [])]
+        if not candidates:
+            raise ValueError("two_stage stage1 threshold tuning requires a non-empty threshold_grid.")
+
+    class_index_to_label = class_metadata.get("class_index_to_label", {})
+    rows: list[dict[str, Any]] = []
+    best_threshold = float(default_threshold)
+    best_pred = baseline_pred
+    best_metrics = baseline_metrics
+    best_per_class = baseline_per_class
+    best_score = float(baseline_metrics.get("macro_f1", 0.0))
+
+    for threshold in candidates:
+        pred = _predict_two_stage_from_fused_probabilities(
+            fused_proba=proba_valid,
+            labels=label_order,
+            decision_mode="soft_fusion_with_dropout_threshold",
+            dropout_idx=dropout_idx,
+            enrolled_idx=enrolled_idx,
+            graduate_idx=graduate_idx,
+            dropout_threshold=float(threshold),
+        )
+        metrics = compute_metrics(pd.Series(y_valid_arr), pred)
+        per_class = compute_per_class_metrics(pd.Series(y_valid_arr), pred, labels=label_order)
+        enrolled_absorbed = int(np.sum((y_valid_arr == int(enrolled_idx)) & (pred == int(dropout_idx))))
+        graduate_absorbed = int(np.sum((y_valid_arr == int(graduate_idx)) & (pred == int(dropout_idx))))
+        rows.append(
+            {
+                "dropout_threshold": float(threshold),
+                "macro_f1": float(metrics.get("macro_f1", 0.0)),
+                "accuracy": float(metrics.get("accuracy", 0.0)),
+                "balanced_accuracy": float(metrics.get("balanced_accuracy", 0.0)),
+                "macro_precision": float(metrics.get("macro_precision", 0.0)),
+                "macro_recall": float(metrics.get("macro_recall", 0.0)),
+                "weighted_f1": float(metrics.get("weighted_f1", 0.0)),
+                "enrolled_absorbed_into_dropout": enrolled_absorbed,
+                "graduate_absorbed_into_dropout": graduate_absorbed,
+                "f1_dropout": float(per_class.get(str(dropout_idx), {}).get("f1", 0.0)),
+                "f1_enrolled": float(per_class.get(str(enrolled_idx), {}).get("f1", 0.0)),
+                "f1_graduate": float(per_class.get(str(graduate_idx), {}).get("f1", 0.0)),
+            }
+        )
+        score = float(metrics.get("macro_f1", 0.0))
+        if (score > best_score + 1e-12) or (abs(score - best_score) <= 1e-12 and float(threshold) < best_threshold):
+            best_threshold = float(threshold)
+            best_pred = pred
+            best_metrics = metrics
+            best_per_class = per_class
+            best_score = score
+
+    return {
+        "status": "applied" if bool(threshold_cfg.get("enabled", False)) else "skipped",
+        "reason": "validation_dropout_threshold_grid_search_completed" if bool(threshold_cfg.get("enabled", False)) else "fixed_threshold",
+        "metric": "macro_f1",
+        "threshold_tuning_requested": bool(threshold_cfg.get("enabled", False)),
+        "threshold_tuning_supported": True,
+        "threshold_tuning_applied": bool(threshold_cfg.get("enabled", False)),
+        "threshold_selection_split": "validation",
+        "threshold_applied_to": "test",
+        "selected_thresholds": {"dropout": float(best_threshold)},
+        "selected_thresholds_by_index": {str(dropout_idx): float(best_threshold)},
+        "selected_dropout_threshold": float(best_threshold),
+        "default_dropout_threshold": float(default_threshold),
+        "validation_baseline_metrics": baseline_metrics,
+        "validation_baseline_per_class": baseline_per_class,
+        "validation_tuned_metrics": best_metrics,
+        "validation_tuned_per_class": best_per_class,
+        "search_evaluated_candidates": int(len(rows) if bool(threshold_cfg.get("enabled", False)) else 0),
+        "threshold_grid_results": rows,
+        "class_names": {
+            str(dropout_idx): str(class_index_to_label.get(str(dropout_idx), "Dropout")),
+            str(enrolled_idx): str(class_index_to_label.get(str(enrolled_idx), "Enrolled")),
+            str(graduate_idx): str(class_index_to_label.get(str(graduate_idx), "Graduate")),
+        },
+        "best_validation_predictions": np.asarray(best_pred, dtype=int).tolist(),
+    }
 
 
 def _tune_two_stage_fused_thresholds(
@@ -2603,52 +2843,93 @@ def _run_two_stage_uct_model(
         class_thresholds=class_thresholds,
     )
 
+    stage_prob_valid = combined_model.predict_stage_probabilities(X_valid)
+    stage_prob_test = combined_model.predict_stage_probabilities(X_test)
     y_proba_valid_final = combined_model.predict_proba(X_valid)
     y_proba_test_final = combined_model.predict_proba(X_test)
     label_order = [int(v) for v in class_metadata.get("class_indices", [dropout_idx, enrolled_idx, graduate_idx])]
-    if decision_mode == "hard_stage1":
+    selected_dropout_threshold = float(threshold_stage1)
+    tuned_thresholds_vec = _threshold_vector_from_map(label_order, class_thresholds)
+    if decision_mode == "hard_routing":
         y_pred_valid_final = combined_model.predict(X_valid)
         y_pred_test_final = combined_model.predict(X_test)
-        tuned_thresholds_vec = _threshold_vector_from_map(label_order, class_thresholds)
         threshold_tuning_result = {
             "status": "skipped",
-            "reason": "hard_stage1_mode_does_not_use_fused_threshold_search",
+            "reason": "hard_routing_mode_uses_fixed_stage1_threshold",
             "metric": "macro_f1",
             "threshold_tuning_requested": False,
-            "threshold_tuning_supported": False,
+            "threshold_tuning_supported": True,
             "threshold_tuning_applied": False,
-            "threshold_selection_split": "none",
-            "threshold_applied_to": "none",
-            "default_decision_rule": "hard_stage1_then_stage2_argmax",
-            "selected_thresholds": {},
-            "selected_thresholds_by_index": {},
+            "threshold_selection_split": "validation",
+            "threshold_applied_to": "test",
+            "default_decision_rule": "hard_routing",
+            "selected_thresholds": {"dropout": float(selected_dropout_threshold)},
+            "selected_thresholds_by_index": {str(dropout_idx): float(selected_dropout_threshold)},
+            "selected_dropout_threshold": float(selected_dropout_threshold),
         }
-    else:
-        threshold_tuning_result = _tune_two_stage_fused_thresholds(
+    elif decision_mode in {"soft_fusion_with_dropout_threshold", "soft_fusion"}:
+        # Tune the stage1 dropout gate against end-to-end 3-class validation macro-F1.
+        threshold_tuning_result = _tune_two_stage_dropout_threshold(
             y_true_valid=y_valid,
             y_proba_valid=np.asarray(y_proba_valid_final, dtype=float),
             labels=label_order,
+            dropout_idx=dropout_idx,
+            enrolled_idx=enrolled_idx,
+            graduate_idx=graduate_idx,
             threshold_cfg=threshold_tuning_cfg,
             class_metadata=class_metadata,
         )
-        selected_thresholds_index = threshold_tuning_result.get("selected_thresholds_by_index", {})
-        selected_threshold_map: dict[int, float] = {}
-        if isinstance(selected_thresholds_index, dict):
-            for key, value in selected_thresholds_index.items():
-                if str(key).lstrip("-").isdigit():
-                    selected_threshold_map[int(key)] = float(value)
-        if not selected_threshold_map:
-            selected_threshold_map = dict(class_thresholds)
-        tuned_thresholds_vec = _threshold_vector_from_map(label_order, selected_threshold_map)
-        y_pred_valid_final = TwoStageUct3ClassClassifier.predict_from_fused_probabilities(
+        selected_dropout_threshold = float(threshold_tuning_result.get("selected_dropout_threshold", threshold_stage1))
+        y_pred_valid_final = _predict_two_stage_from_fused_probabilities(
             fused_proba=np.asarray(y_proba_valid_final, dtype=float),
-            classes=np.asarray(label_order, dtype=int),
-            thresholds=tuned_thresholds_vec,
+            labels=label_order,
+            decision_mode="soft_fusion_with_dropout_threshold",
+            dropout_idx=dropout_idx,
+            enrolled_idx=enrolled_idx,
+            graduate_idx=graduate_idx,
+            dropout_threshold=selected_dropout_threshold,
         )
-        y_pred_test_final = TwoStageUct3ClassClassifier.predict_from_fused_probabilities(
+        y_pred_test_final = _predict_two_stage_from_fused_probabilities(
             fused_proba=np.asarray(y_proba_test_final, dtype=float),
-            classes=np.asarray(label_order, dtype=int),
-            thresholds=tuned_thresholds_vec,
+            labels=label_order,
+            decision_mode="soft_fusion_with_dropout_threshold",
+            dropout_idx=dropout_idx,
+            enrolled_idx=enrolled_idx,
+            graduate_idx=graduate_idx,
+            dropout_threshold=selected_dropout_threshold,
+        )
+    else:
+        threshold_tuning_result = {
+            "status": "skipped",
+            "reason": "pure_soft_argmax_mode",
+            "metric": "macro_f1",
+            "threshold_tuning_requested": False,
+            "threshold_tuning_supported": True,
+            "threshold_tuning_applied": False,
+            "threshold_selection_split": "validation",
+            "threshold_applied_to": "test",
+            "default_decision_rule": "pure_soft_argmax",
+            "selected_thresholds": {},
+            "selected_thresholds_by_index": {},
+            "selected_dropout_threshold": None,
+        }
+        y_pred_valid_final = _predict_two_stage_from_fused_probabilities(
+            fused_proba=np.asarray(y_proba_valid_final, dtype=float),
+            labels=label_order,
+            decision_mode="pure_soft_argmax",
+            dropout_idx=dropout_idx,
+            enrolled_idx=enrolled_idx,
+            graduate_idx=graduate_idx,
+            dropout_threshold=float(threshold_stage1),
+        )
+        y_pred_test_final = _predict_two_stage_from_fused_probabilities(
+            fused_proba=np.asarray(y_proba_test_final, dtype=float),
+            labels=label_order,
+            decision_mode="pure_soft_argmax",
+            dropout_idx=dropout_idx,
+            enrolled_idx=enrolled_idx,
+            graduate_idx=graduate_idx,
+            dropout_threshold=float(threshold_stage1),
         )
 
     metrics: dict[str, float] = {}
@@ -2659,7 +2940,15 @@ def _run_two_stage_uct_model(
     metrics.update({f"test_{k}": float(v) for k, v in test_metrics.items()})
 
     per_class_metrics_test = compute_per_class_metrics(y_test, y_pred_test_final, labels=label_order)
+    per_class_metrics_valid = compute_per_class_metrics(y_valid, y_pred_valid_final, labels=label_order)
     cm = confusion_matrix(y_test, y_pred_test_final, labels=label_order).tolist()
+    classification_report_valid = classification_report(
+        y_valid,
+        y_pred_valid_final,
+        labels=label_order,
+        output_dict=True,
+        zero_division=0,
+    )
     classification_report_test = classification_report(
         y_test,
         y_pred_test_final,
@@ -2695,13 +2984,15 @@ def _run_two_stage_uct_model(
             "stage1": params_stage1,
             "stage2": params_stage2,
             "decision_mode": decision_mode,
-            "threshold_stage1": float(threshold_stage1),
+            "threshold_stage1": float(selected_dropout_threshold),
             "final_class_thresholds": {
                 str(label_order[i]): float(tuned_thresholds_vec[i]) for i in range(len(label_order))
             },
         },
         "labels": label_order,
+        "per_class_metrics_valid": per_class_metrics_valid,
         "per_class_metrics_test": per_class_metrics_test,
+        "classification_report_valid": classification_report_valid,
         "classification_report_test": classification_report_test,
         "y_true_valid": y_valid.tolist(),
         "y_pred_valid": np.asarray(y_pred_valid_final, dtype=int).tolist(),
@@ -2711,11 +3002,32 @@ def _run_two_stage_uct_model(
         "y_proba_test": np.asarray(y_proba_test_final, dtype=float).tolist(),
         "confusion_matrix": cm,
         "class_weight_info": class_weight_combined,
+        "stage1_metrics": {
+            "valid": {k: float(v) for k, v in stage1_result.metrics.items() if str(k).startswith("valid_")},
+            "test": {k: float(v) for k, v in stage1_result.metrics.items() if str(k).startswith("test_")},
+            "classification_report_valid": stage1_result.artifacts.get("classification_report_valid", {}),
+            "classification_report_test": stage1_result.artifacts.get("classification_report_test", {}),
+        },
+        "stage2_metrics": {
+            "valid_non_dropout_only": {k: float(v) for k, v in stage2_result.metrics.items() if str(k).startswith("valid_")},
+            "test_non_dropout_only": {k: float(v) for k, v in stage2_result.metrics.items() if str(k).startswith("test_")},
+            "classification_report_valid": stage2_result.artifacts.get("classification_report_valid", {}),
+            "classification_report_test": stage2_result.artifacts.get("classification_report_test", {}),
+        },
+        "selected_threshold": {
+            "dropout_threshold": (
+                None if threshold_tuning_result.get("selected_dropout_threshold") is None else float(selected_dropout_threshold)
+            ),
+            "mode": str(threshold_tuning_cfg.get("mode", "fixed")),
+            "selection_split": "validation",
+            "objective": "macro_f1",
+        },
+        "threshold_tuning_results": threshold_tuning_result.get("threshold_grid_results", []),
         "two_stage": {
             "enabled": True,
             "mode": mode_name,
             "decision_mode": decision_mode,
-            "threshold_stage1": float(threshold_stage1),
+            "threshold_stage1": float(selected_dropout_threshold) if threshold_tuning_result.get("selected_dropout_threshold") is not None else None,
             "final_class_thresholds": {
                 str(label_order[i]): float(tuned_thresholds_vec[i]) for i in range(len(label_order))
             },
@@ -2760,6 +3072,16 @@ def _run_two_stage_uct_model(
         "class_weight": class_weight_combined,
         "threshold_tuning": threshold_payload,
     }
+    payload["metrics"]["selected_dropout_threshold"] = (
+        float(selected_dropout_threshold) if threshold_tuning_result.get("selected_dropout_threshold") is not None else np.nan
+    )
+    payload["metrics"]["stage1_threshold_mode"] = str(threshold_tuning_cfg.get("mode", "fixed"))
+    payload["metrics"]["test_prediction_rate_dropout"] = float(np.mean(np.asarray(y_pred_test_final, dtype=int) == int(dropout_idx)))
+    payload["metrics"]["test_prediction_rate_enrolled"] = float(np.mean(np.asarray(y_pred_test_final, dtype=int) == int(enrolled_idx)))
+    payload["metrics"]["test_prediction_rate_graduate"] = float(np.mean(np.asarray(y_pred_test_final, dtype=int) == int(graduate_idx)))
+    payload["metrics"]["valid_prediction_rate_dropout"] = float(np.mean(np.asarray(y_pred_valid_final, dtype=int) == int(dropout_idx)))
+    payload["metrics"]["valid_prediction_rate_enrolled"] = float(np.mean(np.asarray(y_pred_valid_final, dtype=int) == int(enrolled_idx)))
+    payload["metrics"]["valid_prediction_rate_graduate"] = float(np.mean(np.asarray(y_pred_valid_final, dtype=int) == int(graduate_idx)))
     if tuning_meta:
         payload["tuning"] = tuning_meta
     two_stage_metadata_path = output_dir / f"two_stage_metadata_{model_token}.json"
@@ -2789,6 +3111,7 @@ def _run_two_stage_uct_model(
         "enabled": bool(threshold_tuning_cfg.get("enabled", False)),
         "metric": str(threshold_tuning_cfg.get("metric", "macro_f1")),
         "selected_thresholds": threshold_payload.get("selected_thresholds", {}),
+        "selected_dropout_threshold": threshold_payload.get("selected_dropout_threshold"),
         "validation_score_before": float(threshold_payload.get("validation_baseline_metrics", {}).get("macro_f1", 0.0)),
         "validation_score_after": float(threshold_payload.get("validation_tuned_metrics", {}).get("macro_f1", 0.0)),
         "search_evaluated_candidates": int(threshold_payload.get("search_evaluated_candidates", 0)),
@@ -2796,12 +3119,70 @@ def _run_two_stage_uct_model(
     two_stage_metadata_path.write_text(json.dumps(two_stage_metadata_payload, indent=2), encoding="utf-8")
     calibration_metadata_path.write_text(json.dumps(calibration_metadata_payload, indent=2), encoding="utf-8")
     threshold_metadata_path.write_text(json.dumps(threshold_metadata_payload, indent=2), encoding="utf-8")
+    threshold_results_path = output_dir / f"threshold_tuning_results_{model_token}.csv"
+    selected_threshold_path = output_dir / f"selected_threshold_{model_token}.json"
+    two_stage_diagnostics_path = output_dir / f"two_stage_diagnostics_{model_token}.json"
+    stage1_metrics_path = output_dir / f"stage1_metrics_{model_token}.json"
+    stage2_metrics_path = output_dir / f"stage2_metrics_{model_token}.json"
+    pd.DataFrame(threshold_tuning_result.get("threshold_grid_results", [])).to_csv(threshold_results_path, index=False)
+    selected_threshold_path.write_text(json.dumps(artifacts["selected_threshold"], indent=2), encoding="utf-8")
+    two_stage_diagnostics_payload = {
+        "model": model_name,
+        "decision_mode": decision_mode,
+        "selected_dropout_threshold": threshold_tuning_result.get("selected_dropout_threshold"),
+        "validation_macro_f1_by_threshold": threshold_tuning_result.get("threshold_grid_results", []),
+        "validation_enrolled_absorbed_into_dropout_at_selected_threshold": int(
+            np.sum((np.asarray(y_valid, dtype=int) == int(enrolled_idx)) & (np.asarray(y_pred_valid_final, dtype=int) == int(dropout_idx)))
+        ),
+        "test_class_distribution": {
+            "dropout": int(np.sum(np.asarray(y_pred_test_final, dtype=int) == int(dropout_idx))),
+            "enrolled": int(np.sum(np.asarray(y_pred_test_final, dtype=int) == int(enrolled_idx))),
+            "graduate": int(np.sum(np.asarray(y_pred_test_final, dtype=int) == int(graduate_idx))),
+        },
+    }
+    two_stage_diagnostics_path.write_text(json.dumps(two_stage_diagnostics_payload, indent=2), encoding="utf-8")
+    stage1_metrics_path.write_text(json.dumps(artifacts["stage1_metrics"], indent=2), encoding="utf-8")
+    stage2_metrics_path.write_text(json.dumps(artifacts["stage2_metrics"], indent=2), encoding="utf-8")
+
+    prediction_export_test = pd.DataFrame(
+        {
+            "selected_threshold": (
+                float(selected_dropout_threshold) if threshold_tuning_result.get("selected_dropout_threshold") is not None else np.nan
+            ),
+            "stage1_prob_dropout": np.asarray(stage_prob_test.get("stage1_prob_dropout", []), dtype=float),
+            "stage1_prob_non_dropout": np.asarray(stage_prob_test.get("stage1_prob_non_dropout", []), dtype=float),
+            "stage2_prob_enrolled": np.asarray(stage_prob_test.get("stage2_prob_enrolled", []), dtype=float),
+            "stage2_prob_graduate": np.asarray(stage_prob_test.get("stage2_prob_graduate", []), dtype=float),
+        }
+    )
+    prediction_export_valid = pd.DataFrame(
+        {
+            "selected_threshold": (
+                float(selected_dropout_threshold) if threshold_tuning_result.get("selected_dropout_threshold") is not None else np.nan
+            ),
+            "stage1_prob_dropout": np.asarray(stage_prob_valid.get("stage1_prob_dropout", []), dtype=float),
+            "stage1_prob_non_dropout": np.asarray(stage_prob_valid.get("stage1_prob_non_dropout", []), dtype=float),
+            "stage2_prob_enrolled": np.asarray(stage_prob_valid.get("stage2_prob_enrolled", []), dtype=float),
+            "stage2_prob_graduate": np.asarray(stage_prob_valid.get("stage2_prob_graduate", []), dtype=float),
+        }
+    )
+    artifacts["prediction_export_test"] = prediction_export_test
+    artifacts["prediction_export_valid"] = prediction_export_valid
+    artifacts["two_stage_diagnostics"] = two_stage_diagnostics_payload
+    payload["artifacts"]["prediction_export_test"] = prediction_export_test
+    payload["artifacts"]["prediction_export_valid"] = prediction_export_valid
+    payload["artifacts"]["two_stage_diagnostics"] = two_stage_diagnostics_payload
     payload["artifact_paths"] = {
         "stage1_model": str(stage1_model_path),
         "stage2_model": str(stage2_model_path),
         "two_stage_metadata": str(two_stage_metadata_path),
         "calibration_metadata": str(calibration_metadata_path),
         "threshold_tuning_metadata": str(threshold_metadata_path),
+        "threshold_tuning_results_csv": str(threshold_results_path),
+        "selected_threshold_json": str(selected_threshold_path),
+        "two_stage_diagnostics_json": str(two_stage_diagnostics_path),
+        "stage1_metrics_json": str(stage1_metrics_path),
+        "stage2_metrics_json": str(stage2_metrics_path),
     }
     if tuning_artifacts:
         payload["artifact_paths"].update(tuning_artifacts)
@@ -3486,23 +3867,18 @@ def run_experiment(experiment_config_path: Path, compact_summary: bool | None = 
     retrain_on_full_train_split = bool(exp_cfg.get("models", {}).get("retrain_on_full_train_split", False))
     class_weight_cfg = _resolve_class_weight_config(exp_cfg=exp_cfg, class_metadata=class_metadata)
     threshold_tuning_cfg = _resolve_threshold_tuning_config(exp_cfg)
-    two_stage_mode_aliases = {
-        "two_stage": "hard_stage1",
-        "hierarchical": "hard_stage1",
-        "two_stage_uct_3class": "hard_stage1",
-        "two_stage_soft": "soft_fused",
-        "two_stage_uct_3class_soft": "soft_fused",
-    }
-    two_stage_decision_mode = two_stage_mode_aliases.get(experiment_mode)
+    two_stage_decision_mode = _resolve_two_stage_decision_mode(
+        experiment_mode=experiment_mode,
+        two_stage_cfg=exp_cfg.get("two_stage", {}) if isinstance(exp_cfg.get("two_stage", {}), dict) else {},
+    )
     two_stage_enabled = two_stage_decision_mode is not None
     if two_stage_enabled and (dataset_name != "uct_student" or formulation != "three_class"):
         raise ValueError(
             "two_stage modes are only supported for dataset=uct_student and target_formulation=three_class."
         )
     two_stage_cfg = exp_cfg.get("two_stage", {}) if isinstance(exp_cfg.get("two_stage", {}), dict) else {}
-    threshold_stage1 = float(two_stage_cfg.get("threshold_stage1", 0.5))
-    if threshold_stage1 < 0.0 or threshold_stage1 > 1.0:
-        raise ValueError("two_stage.threshold_stage1 must be within [0.0, 1.0].")
+    two_stage_stage1_threshold_cfg = _resolve_two_stage_stage1_dropout_threshold_config(two_stage_cfg)
+    threshold_stage1 = float(two_stage_stage1_threshold_cfg.get("dropout_threshold", 0.5))
     two_stage_calibration_cfg = _resolve_two_stage_calibration_config(two_stage_cfg)
     two_stage_class_thresholds: dict[int, float] = {}
     two_stage_threshold_tuning_cfg: dict[str, Any] = {
@@ -3529,13 +3905,15 @@ def run_experiment(experiment_config_path: Path, compact_summary: bool | None = 
             enrolled_idx=enrolled_idx_cfg,
             graduate_idx=graduate_idx_cfg,
         )
+        if str(two_stage_decision_mode).strip().lower() in {"soft_fusion_with_dropout_threshold", "soft_fusion"}:
+            two_stage_threshold_tuning_cfg = dict(two_stage_stage1_threshold_cfg)
     if two_stage_enabled:
         threshold_tuning_cfg = {
             "enabled": bool(two_stage_threshold_tuning_cfg.get("enabled", False)),
             "objective": str(two_stage_threshold_tuning_cfg.get("metric", "macro_f1")),
             "focus_class": "all_classes",
             "apply_on_test": True,
-            "grid": [],
+            "grid": list(two_stage_threshold_tuning_cfg.get("threshold_grid", [])),
             "reason": "managed_by_two_stage_fused_threshold_tuning",
         }
     training_cfg = exp_cfg.get("training", {}) if isinstance(exp_cfg.get("training", {}), dict) else {}

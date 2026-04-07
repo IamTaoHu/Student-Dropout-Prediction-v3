@@ -9,7 +9,9 @@ import numpy as np
 import pandas as pd
 
 from scripts.run_experiment import (
+    _resolve_two_stage_decision_mode,
     _resolve_two_stage_stage2_positive_target_label,
+    _resolve_two_stage_stage1_dropout_threshold_config,
     _resolve_two_stage_stage_class_weights,
 )
 from src.models.two_stage_uct import TwoStageUct3ClassClassifier
@@ -113,6 +115,63 @@ class TwoStageConfigTests(unittest.TestCase):
             graduate_idx=2,
         )
         self.assertEqual(resolved, 1)
+
+    def test_soft_fusion_with_dropout_threshold_overrides_dropout_before_argmax(self) -> None:
+        stage1_model = _DummyBinaryModel([[0.49, 0.51], [0.55, 0.45]])
+        stage2_model = _DummyBinaryModel([[0.1, 0.9], [0.8, 0.2]])
+        model = TwoStageUct3ClassClassifier(
+            stage1_model=stage1_model,
+            stage2_model=stage2_model,
+            dropout_label=0,
+            enrolled_label=1,
+            graduate_label=2,
+            decision_mode="soft_fusion_with_dropout_threshold",
+            threshold_stage1=0.5,
+            stage1_positive_label=1,
+            stage2_positive_label=1,
+            stage2_positive_target_label=1,
+        )
+
+        X = pd.DataFrame({"f1": [1.0, 2.0]})
+        pred = model.predict(X)
+
+        self.assertListEqual(pred.tolist(), [0, 2])
+
+    def test_new_soft_fusion_config_exists_and_matches_expected_contract_shape(self) -> None:
+        try:
+            import yaml
+        except Exception:
+            self.skipTest("PyYAML is not installed in this environment.")
+
+        path = Path("configs/experiments/exp_uct_3class_two_stage_v2_soft_fusion.yaml")
+        self.assertTrue(path.exists(), msg=f"Missing required config: {path}")
+        payload = yaml.safe_load(path.read_text(encoding="utf-8"))
+
+        self.assertEqual(payload["experiment"]["id"], "exp_uct_3class_two_stage_v2_soft_fusion")
+        self.assertEqual(payload["experiment"]["mode"], "two_stage")
+        self.assertEqual(payload["outputs"]["results_dir"], "results/exp_uct_3class_two_stage_v2_soft_fusion")
+        self.assertEqual(payload["two_stage"]["final_decision"]["mode"], "soft_fusion_with_dropout_threshold")
+        self.assertEqual(payload["two_stage"]["stage1"]["threshold_mode"], "tune")
+        self.assertListEqual(
+            payload["models"]["candidates"],
+            ["decision_tree", "random_forest", "svm", "gradient_boosting", "xgboost", "lightgbm", "catboost"],
+        )
+
+    def test_new_two_stage_config_helpers_resolve_soft_fusion_threshold_mode(self) -> None:
+        two_stage_cfg = {
+            "stage1": {
+                "threshold_mode": "tune",
+                "dropout_threshold": 0.5,
+                "threshold_grid": [0.4, 0.5, 0.6],
+            },
+            "final_decision": {"mode": "soft_fusion"},
+        }
+        threshold_cfg = _resolve_two_stage_stage1_dropout_threshold_config(two_stage_cfg)
+        decision_mode = _resolve_two_stage_decision_mode("two_stage", two_stage_cfg)
+
+        self.assertEqual(threshold_cfg["mode"], "tune")
+        self.assertEqual(threshold_cfg["threshold_grid"], [0.4, 0.5, 0.6])
+        self.assertEqual(decision_mode, "soft_fusion_with_dropout_threshold")
 
 
 if __name__ == "__main__":
