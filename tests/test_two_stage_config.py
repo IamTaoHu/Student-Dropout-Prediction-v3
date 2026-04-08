@@ -116,6 +116,30 @@ class TwoStageConfigTests(unittest.TestCase):
         )
         self.assertEqual(resolved, 1)
 
+    def test_two_stage_class_weight_resolution_supports_new_stage_specific_schema(self) -> None:
+        stage1_cfg, stage2_cfg = _resolve_two_stage_stage_class_weights(
+            two_stage_cfg={
+                "stage1": {
+                    "class_weight_mode": "custom",
+                    "class_weight_positive": 1.0,
+                    "class_weight_negative": 1.15,
+                },
+                "stage2": {
+                    "class_weight_mode": "custom",
+                    "class_weight_map": {"enrolled": 1.35, "graduate": 1.0},
+                },
+            },
+            class_weight_cfg={"enabled": True, "mode": "balanced"},
+            dropout_idx=0,
+            enrolled_idx=1,
+            graduate_idx=2,
+        )
+
+        self.assertEqual(stage1_cfg["mode"], "explicit")
+        self.assertEqual(stage1_cfg["values"], {"Non-Dropout": 1.15, "Dropout": 1.0})
+        self.assertEqual(stage2_cfg["mode"], "explicit")
+        self.assertEqual(stage2_cfg["values"], {"Graduate": 1.0, "Enrolled": 1.35})
+
     def test_soft_fusion_with_dropout_threshold_overrides_dropout_before_argmax(self) -> None:
         stage1_model = _DummyBinaryModel([[0.49, 0.51], [0.55, 0.45]])
         stage2_model = _DummyBinaryModel([[0.1, 0.9], [0.8, 0.2]])
@@ -136,6 +160,29 @@ class TwoStageConfigTests(unittest.TestCase):
         pred = model.predict(X)
 
         self.assertListEqual(pred.tolist(), [0, 2])
+
+    def test_soft_fusion_with_middle_band_routes_ambiguous_cases_through_full_fused_argmax(self) -> None:
+        stage1_model = _DummyBinaryModel([[0.45, 0.55], [0.48, 0.52], [0.70, 0.30]])
+        stage2_model = _DummyBinaryModel([[0.1, 0.9], [0.9, 0.1], [0.7, 0.3]])
+        model = TwoStageUct3ClassClassifier(
+            stage1_model=stage1_model,
+            stage2_model=stage2_model,
+            dropout_label=0,
+            enrolled_label=1,
+            graduate_label=2,
+            decision_mode="soft_fusion_with_middle_band",
+            threshold_stage1=0.5,
+            threshold_stage1_low=0.40,
+            threshold_stage1_high=0.60,
+            stage1_positive_label=1,
+            stage2_positive_label=1,
+            stage2_positive_target_label=1,
+        )
+
+        X = pd.DataFrame({"f1": [1.0, 2.0, 3.0]})
+        pred = model.predict(X)
+
+        self.assertListEqual(pred.tolist(), [1, 0, 2])
 
     def test_new_soft_fusion_config_exists_and_matches_expected_contract_shape(self) -> None:
         try:
@@ -171,7 +218,51 @@ class TwoStageConfigTests(unittest.TestCase):
 
         self.assertEqual(threshold_cfg["mode"], "tune")
         self.assertEqual(threshold_cfg["threshold_grid"], [0.4, 0.5, 0.6])
-        self.assertEqual(decision_mode, "soft_fusion_with_dropout_threshold")
+        self.assertEqual(decision_mode, "soft_fusion")
+
+    def test_v3_two_stage_config_exists_and_matches_expected_contract_shape(self) -> None:
+        try:
+            import yaml
+        except Exception:
+            self.skipTest("PyYAML is not installed in this environment.")
+
+        path = Path("configs/experiments/exp_uct_3class_two_stage_v3_enrolled_push.yaml")
+        self.assertTrue(path.exists(), msg=f"Missing required config: {path}")
+        payload = yaml.safe_load(path.read_text(encoding="utf-8"))
+
+        self.assertEqual(payload["experiment"]["id"], "exp_uct_3class_two_stage_v3_enrolled_push")
+        self.assertEqual(payload["experiment"]["mode"], "two_stage")
+        self.assertEqual(payload["outputs"]["results_dir"], "results/exp_uct_3class_two_stage_v3_enrolled_push")
+        self.assertEqual(payload["pipeline"]["task_type"], "two_stage_multiclass")
+        self.assertEqual(payload["two_stage"]["final_decision"]["mode"], "soft_fusion_with_middle_band")
+        self.assertTrue(bool(payload["two_stage"]["final_decision"]["middle_band_enabled"]))
+        self.assertEqual(payload["two_stage"]["threshold_tuning"]["search_mode"], "band")
+        self.assertEqual(payload["two_stage"]["threshold_tuning"]["objective"], "macro_f1_plus_enrolled_f1")
+        self.assertAlmostEqual(float(payload["two_stage"]["threshold_tuning"]["enrolled_push_alpha"]), 0.35)
+        self.assertListEqual(
+            payload["models"]["candidates"],
+            ["decision_tree", "random_forest", "svm", "gradient_boosting", "xgboost", "lightgbm", "catboost"],
+        )
+
+    def test_v4_auto_balance_config_exists_and_matches_expected_contract_shape(self) -> None:
+        try:
+            import yaml
+        except Exception:
+            self.skipTest("PyYAML is not installed in this environment.")
+
+        path = Path("configs/experiments/exp_uct_3class_two_stage_v4_balance_auto.yaml")
+        self.assertTrue(path.exists(), msg=f"Missing required config: {path}")
+        payload = yaml.safe_load(path.read_text(encoding="utf-8"))
+
+        self.assertEqual(payload["experiment"]["id"], "exp_uct_3class_two_stage_v4_balance_auto")
+        self.assertEqual(payload["experiment"]["mode"], "two_stage")
+        self.assertEqual(payload["pipeline"]["task_type"], "two_stage_multiclass")
+        self.assertEqual(payload["two_stage"]["final_decision"]["mode"], "soft_fusion_with_middle_band")
+        self.assertEqual(payload["two_stage"]["stage1"]["class_weight_mode"], "auto_search")
+        self.assertEqual(payload["two_stage"]["stage2"]["class_weight_mode"], "auto_search")
+        self.assertTrue(bool(payload["two_stage"]["auto_balance_search"]["enabled"]))
+        self.assertEqual(payload["two_stage"]["selection"]["objective"], "constrained_macro_with_class_floors")
+        self.assertEqual(payload["outputs"]["results_dir"], "results/exp_uct_3class_two_stage_v4_balance_auto")
 
 
 if __name__ == "__main__":

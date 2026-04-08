@@ -20,6 +20,10 @@ class TwoStageUct3ClassClassifier:
     graduate_label: int
     decision_mode: str = "soft_fused"
     threshold_stage1: float = 0.5
+    threshold_stage1_low: float | None = None
+    threshold_stage1_high: float | None = None
+    middle_band_enabled: bool = False
+    middle_band_behavior: str = "force_stage2_soft_fusion"
     stage1_positive_label: int = 1
     stage2_positive_label: int = 1
     stage2_positive_target_label: int | None = None
@@ -31,19 +35,32 @@ class TwoStageUct3ClassClassifier:
             "soft_fused": "soft_fused",
             "hard_stage1": "hard_routing",
             "hard_routing": "hard_routing",
-            "soft_fusion": "soft_fusion_with_dropout_threshold",
+            "soft_fusion": "soft_fusion",
             "soft_fusion_with_dropout_threshold": "soft_fusion_with_dropout_threshold",
+            "soft_fusion_with_middle_band": "soft_fusion_with_middle_band",
             "pure_soft_argmax": "pure_soft_argmax",
         }
         if mode not in alias_map:
             raise ValueError(
                 "decision_mode must be one of: soft_fused, hard_stage1, hard_routing, "
-                "soft_fusion, soft_fusion_with_dropout_threshold, pure_soft_argmax."
+                "soft_fusion, soft_fusion_with_dropout_threshold, soft_fusion_with_middle_band, pure_soft_argmax."
             )
         mode = alias_map[mode]
         self.decision_mode = mode
         if self.threshold_stage1 < 0.0 or self.threshold_stage1 > 1.0:
             raise ValueError("threshold_stage1 must be within [0.0, 1.0].")
+        if self.threshold_stage1_low is None:
+            self.threshold_stage1_low = float(self.threshold_stage1)
+        if self.threshold_stage1_high is None:
+            self.threshold_stage1_high = float(self.threshold_stage1)
+        self.threshold_stage1_low = float(self.threshold_stage1_low)
+        self.threshold_stage1_high = float(self.threshold_stage1_high)
+        if self.threshold_stage1_low < 0.0 or self.threshold_stage1_low > 1.0:
+            raise ValueError("threshold_stage1_low must be within [0.0, 1.0].")
+        if self.threshold_stage1_high < 0.0 or self.threshold_stage1_high > 1.0:
+            raise ValueError("threshold_stage1_high must be within [0.0, 1.0].")
+        if self.threshold_stage1_low > self.threshold_stage1_high:
+            raise ValueError("threshold_stage1_low must be <= threshold_stage1_high.")
 
         self.classes_ = np.array(
             [int(self.dropout_label), int(self.enrolled_label), int(self.graduate_label)],
@@ -186,6 +203,59 @@ class TwoStageUct3ClassClassifier:
         )
 
     @staticmethod
+    def predict_with_middle_band_from_fused_probabilities(
+        fused_proba: np.ndarray,
+        classes: np.ndarray,
+        *,
+        dropout_label: int,
+        enrolled_label: int,
+        graduate_label: int,
+        low_threshold: float,
+        high_threshold: float,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        if low_threshold < 0.0 or low_threshold > 1.0:
+            raise ValueError("low_threshold must be within [0.0, 1.0].")
+        if high_threshold < 0.0 or high_threshold > 1.0:
+            raise ValueError("high_threshold must be within [0.0, 1.0].")
+        if low_threshold >= high_threshold:
+            raise ValueError("low_threshold must be < high_threshold for middle-band routing.")
+
+        classes_arr = np.asarray(classes, dtype=int)
+        class_to_index = {int(label): idx for idx, label in enumerate(classes_arr.tolist())}
+        try:
+            dropout_idx = class_to_index[int(dropout_label)]
+            enrolled_idx = class_to_index[int(enrolled_label)]
+            graduate_idx = class_to_index[int(graduate_label)]
+        except KeyError as exc:
+            raise ValueError("classes must include dropout, enrolled, and graduate labels.") from exc
+
+        preds = np.empty(fused_proba.shape[0], dtype=int)
+        regions = np.empty(fused_proba.shape[0], dtype=object)
+        p_dropout = fused_proba[:, dropout_idx]
+        p_enrolled = fused_proba[:, enrolled_idx]
+        p_graduate = fused_proba[:, graduate_idx]
+
+        hard_dropout_mask = p_dropout >= float(high_threshold)
+        safe_non_dropout_mask = p_dropout <= float(low_threshold)
+        middle_band_mask = (~hard_dropout_mask) & (~safe_non_dropout_mask)
+
+        preds[hard_dropout_mask] = int(dropout_label)
+        regions[hard_dropout_mask] = "hard_dropout"
+
+        preds[safe_non_dropout_mask] = np.where(
+            p_enrolled[safe_non_dropout_mask] >= p_graduate[safe_non_dropout_mask],
+            int(enrolled_label),
+            int(graduate_label),
+        )
+        regions[safe_non_dropout_mask] = "safe_non_dropout"
+
+        if np.any(middle_band_mask):
+            middle_pred_idx = np.argmax(fused_proba[middle_band_mask], axis=1)
+            preds[middle_band_mask] = classes_arr[middle_pred_idx]
+            regions[middle_band_mask] = "middle_band"
+        return preds, regions.astype(str)
+
+    @staticmethod
     def predict_with_dropout_threshold_from_fused_probabilities(
         fused_proba: np.ndarray,
         classes: np.ndarray,
@@ -280,6 +350,9 @@ class TwoStageUct3ClassClassifier:
             ).astype(int)
 
         fused_proba = self.predict_proba(X_df)
+        if self.decision_mode in {"soft_fusion", "pure_soft_argmax"}:
+            pred_idx = np.argmax(fused_proba, axis=1)
+            return self.classes_[pred_idx].astype(int)
         if self.decision_mode == "soft_fusion_with_dropout_threshold":
             return self.predict_with_dropout_threshold_from_fused_probabilities(
                 fused_proba=fused_proba,
@@ -289,7 +362,15 @@ class TwoStageUct3ClassClassifier:
                 graduate_label=int(self.graduate_label),
                 dropout_threshold=float(self.threshold_stage1),
             ).astype(int)
-        if self.decision_mode == "pure_soft_argmax":
-            pred_idx = np.argmax(fused_proba, axis=1)
-            return self.classes_[pred_idx].astype(int)
+        if self.decision_mode == "soft_fusion_with_middle_band":
+            pred, _ = self.predict_with_middle_band_from_fused_probabilities(
+                fused_proba=fused_proba,
+                classes=self.classes_,
+                dropout_label=int(self.dropout_label),
+                enrolled_label=int(self.enrolled_label),
+                graduate_label=int(self.graduate_label),
+                low_threshold=float(self.threshold_stage1_low),
+                high_threshold=float(self.threshold_stage1_high),
+            )
+            return pred.astype(int)
         return self._predict_soft_thresholded(fused_proba).astype(int)

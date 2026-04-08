@@ -1,0 +1,160 @@
+experiment:
+  id: exp_uct_3class_two_stage_v4_balance_auto
+  mode: two_stage
+  seed: 42
+  dataset_config: configs/datasets/uct_student.yaml
+  target_formulation: three_class
+
+pipeline:
+  task_type: two_stage_multiclass
+  final_classes: [dropout, enrolled, graduate]
+
+target:
+  class_order: [Dropout, Enrolled, Graduate]
+
+target_mapping_override:
+  three_class:
+    Dropout: 0
+    Enrolled: 1
+    Graduate: 2
+
+splits:
+  test_size: 0.20
+  validation_size: 0.20
+  stratify_column: target
+
+preprocessing:
+  drop_missing_rows: true
+  missing_values:
+    drop_rows: true
+  imputation: median_mode
+  encoding: onehot
+  scaling: standard
+  require_onehot_encoding: true
+  outlier:
+    enabled: true
+    method: isolation_forest
+  balancing:
+    enabled: true
+    method: smote
+
+feature_engineering:
+  dataset_features:
+    derive_safe_features: true
+
+models:
+  candidates:
+    - decision_tree
+    - random_forest
+    - svm
+    - gradient_boosting
+    - xgboost
+    - lightgbm
+    - catboost
+  tuning:
+    backend: optuna
+    n_trials: 20
+    cv_folds: 3
+    scoring: macro_f1
+    objective_source: validation
+    objective_metric: macro_f1
+    per_model_n_trials:
+      decision_tree: 8
+      random_forest: 12
+      svm: 12
+      gradient_boosting: 12
+      xgboost: 20
+      lightgbm: 20
+      catboost: 20
+  retrain_on_full_train_split: true
+
+evaluation:
+  metrics:
+    - accuracy
+    - macro_f1
+    - weighted_f1
+    - balanced_accuracy
+    - macro_precision
+    - macro_recall
+  compare_default_argmax: true
+  decision_rule: model_predict
+  save_confusion_matrix: true
+  save_classification_report: true
+  cross_validation:
+    enabled: true
+    n_splits: 5
+    shuffle: true
+    random_state: 42
+
+selection:
+  primary: macro_f1
+  tie_breakers:
+    - balanced_accuracy
+    - accuracy
+
+metrics:
+  primary: macro_f1
+  secondary:
+    - accuracy
+    - weighted_f1
+    - balanced_accuracy
+    - macro_precision
+    - macro_recall
+
+two_stage:
+  enabled: true
+
+  stage1:
+    name: dropout_vs_non_dropout
+    positive_class: dropout
+    negative_group: [enrolled, graduate]
+    threshold_mode: auto_search
+    dropout_threshold: 0.50
+    stage1_dropout_threshold_low: 0.30
+    stage1_dropout_threshold_high: 0.55
+    class_weight_mode: auto_search
+
+  stage2:
+    name: enrolled_vs_graduate
+    classes: [enrolled, graduate]
+    class_weight_mode: auto_search
+
+  final_decision:
+    mode: soft_fusion_with_middle_band
+    middle_band_enabled: true
+    middle_band_behavior: force_stage2_soft_fusion
+
+  stage2_positive_class: enrolled
+
+  auto_balance_search:
+    enabled: true
+    search_mode: grid
+    threshold_strategy: auto_search
+    threshold_search_mode: band
+    max_configs_per_model: 120
+    early_stop_if_no_improvement_after: 25
+    random_subsample_configs_if_too_large: true
+    stage1_non_dropout_weight_grid: [1.00, 1.05, 1.10, 1.15, 1.20]
+    stage2_enrolled_weight_grid: [1.00, 1.10, 1.20, 1.30, 1.40]
+    enrolled_push_alpha_grid: [0.05, 0.10, 0.20, 0.30, 0.40]
+    threshold_grid_low: [0.20, 0.25, 0.30, 0.35, 0.40]
+    threshold_grid_high: [0.45, 0.50, 0.55, 0.60, 0.65, 0.70]
+
+  selection:
+    objective: constrained_macro_with_class_floors
+    dropout_f1_floor: 0.76
+    graduate_f1_floor: 0.82
+    enrolled_f1_soft_target: 0.52
+    penalty_value: -999999.0
+    tie_break_order:
+      - macro_f1
+      - enrolled_f1
+      - balanced_accuracy
+      - macro_recall
+      - simpler_config
+
+outputs:
+  results_dir: results/exp_uct_3class_two_stage_v4_balance_auto
+  runtime_artifact_format: csv
+  mirror_benchmark_outputs_to_runtime: true
+  save_artifact_manifest: true
