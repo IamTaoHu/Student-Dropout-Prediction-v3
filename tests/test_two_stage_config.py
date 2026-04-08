@@ -10,6 +10,7 @@ import pandas as pd
 
 from scripts.run_experiment import (
     _resolve_two_stage_decision_mode,
+    _resolve_two_stage_stage2_decision_config,
     _resolve_two_stage_stage2_positive_target_label,
     _resolve_two_stage_stage1_dropout_threshold_config,
     _resolve_two_stage_stage_class_weights,
@@ -184,6 +185,64 @@ class TwoStageConfigTests(unittest.TestCase):
 
         self.assertListEqual(pred.tolist(), [1, 0, 2])
 
+    def test_stage2_guarded_threshold_can_select_enrolled_without_overriding_dropout(self) -> None:
+        stage1_model = _DummyBinaryModel([[0.7, 0.3], [0.2, 0.8], [0.45, 0.55]])
+        stage2_model = _DummyBinaryModel([[0.45, 0.55], [0.46, 0.54], [0.49, 0.51]])
+        model = TwoStageUct3ClassClassifier(
+            stage1_model=stage1_model,
+            stage2_model=stage2_model,
+            dropout_label=0,
+            enrolled_label=1,
+            graduate_label=2,
+            decision_mode="soft_fusion_with_dropout_threshold",
+            threshold_stage1=0.5,
+            stage1_positive_label=1,
+            stage2_positive_label=1,
+            stage2_positive_target_label=1,
+            stage2_decision_config={
+                "enabled": True,
+                "strategy": "enrolled_guarded_threshold",
+                "enrolled_probability_threshold": 0.50,
+                "graduate_margin_guard": 0.10,
+            },
+        )
+
+        X = pd.DataFrame({"f1": [1.0, 2.0, 3.0]})
+        pred = model.predict(X)
+
+        self.assertListEqual(pred.tolist(), [2, 0, 1])
+
+    def test_stage2_decision_config_resolver_builds_validation_search_grid(self) -> None:
+        resolved = _resolve_two_stage_stage2_decision_config(
+            {
+                "stage2_decision": {
+                    "enabled": True,
+                    "strategy": "enrolled_guarded_threshold",
+                    "enrolled_probability_threshold": 0.42,
+                    "graduate_margin_guard": 0.06,
+                    "tune_on_validation": True,
+                    "search": {
+                        "enrolled_probability_threshold": {"min": 0.30, "max": 0.34, "step": 0.02},
+                        "graduate_margin_guard": {"min": 0.00, "max": 0.04, "step": 0.02},
+                    },
+                    "objective": {
+                        "enrolled_f1_alpha": 0.4,
+                        "graduate_f1_penalty_beta": 1.7,
+                    },
+                }
+            }
+        )
+
+        self.assertTrue(resolved["enabled"])
+        self.assertEqual(resolved["strategy"], "enrolled_guarded_threshold")
+        self.assertListEqual(
+            resolved["search"]["enrolled_probability_threshold_grid"],
+            [0.3, 0.32, 0.34],
+        )
+        self.assertListEqual(resolved["search"]["graduate_margin_guard_grid"], [0.0, 0.02, 0.04])
+        self.assertAlmostEqual(float(resolved["objective"]["enrolled_f1_alpha"]), 0.4)
+        self.assertAlmostEqual(float(resolved["objective"]["graduate_f1_penalty_beta"]), 1.7)
+
     def test_new_soft_fusion_config_exists_and_matches_expected_contract_shape(self) -> None:
         try:
             import yaml
@@ -263,6 +322,58 @@ class TwoStageConfigTests(unittest.TestCase):
         self.assertTrue(bool(payload["two_stage"]["auto_balance_search"]["enabled"]))
         self.assertEqual(payload["two_stage"]["selection"]["objective"], "constrained_macro_with_class_floors")
         self.assertEqual(payload["outputs"]["results_dir"], "results/exp_uct_3class_two_stage_v4_balance_auto")
+
+    def test_v5_guarded_stage2_config_exists_and_matches_expected_contract_shape(self) -> None:
+        try:
+            import yaml
+        except Exception:
+            self.skipTest("PyYAML is not installed in this environment.")
+
+        path = Path("configs/experiments/exp_uct_3class_two_stage_v5_enrolled_guarded_threshold.yaml")
+        self.assertTrue(path.exists(), msg=f"Missing required config: {path}")
+        payload = yaml.safe_load(path.read_text(encoding="utf-8"))
+
+        self.assertEqual(payload["experiment"]["id"], "exp_uct_3class_two_stage_v5_enrolled_guarded_threshold")
+        self.assertEqual(payload["experiment"]["mode"], "two_stage")
+        self.assertEqual(payload["pipeline"]["task_type"], "two_stage_multiclass")
+        self.assertEqual(payload["two_stage"]["stage1"]["threshold_mode"], "fixed")
+        self.assertTrue(bool(payload["two_stage"]["stage2_decision"]["enabled"]))
+        self.assertEqual(payload["two_stage"]["stage2_decision"]["strategy"], "enrolled_guarded_threshold")
+        self.assertTrue(bool(payload["two_stage"]["auto_balance_search"]["enabled"]))
+        self.assertListEqual(payload["two_stage"]["auto_balance_search"]["threshold_grid_low"], [0.30])
+        self.assertListEqual(payload["two_stage"]["auto_balance_search"]["threshold_grid_high"], [0.55])
+        self.assertEqual(
+            payload["outputs"]["results_dir"],
+            "results/exp_uct_3class_two_stage_v5_enrolled_guarded_threshold",
+        )
+
+    def test_v5_optuna_guarded_stage2_config_exists_and_matches_expected_contract_shape(self) -> None:
+        try:
+            import yaml
+        except Exception:
+            self.skipTest("PyYAML is not installed in this environment.")
+
+        path = Path("configs/experiments/exp_uct_3class_two_stage_v5_enrolled_optuna_guarded.yaml")
+        self.assertTrue(path.exists(), msg=f"Missing required config: {path}")
+        payload = yaml.safe_load(path.read_text(encoding="utf-8"))
+
+        self.assertEqual(payload["experiment"]["id"], "exp_uct_3class_two_stage_v5_enrolled_optuna_guarded")
+        self.assertEqual(payload["experiment"]["mode"], "two_stage")
+        self.assertEqual(payload["pipeline"]["task_type"], "two_stage_multiclass")
+        self.assertEqual(payload["two_stage"]["stage1"]["threshold_mode"], "fixed")
+        self.assertEqual(payload["two_stage"]["stage1"]["class_weight_mode"], "balanced")
+        self.assertEqual(payload["two_stage"]["stage2"]["class_weight_mode"], "custom")
+        self.assertTrue(bool(payload["two_stage"]["stage2"]["optuna_tuning"]["enabled"]))
+        self.assertEqual(payload["two_stage"]["stage2"]["optuna_tuning"]["method"], "optuna")
+        self.assertEqual(payload["two_stage"]["stage2"]["optuna_tuning"]["sampler"], "tpe")
+        self.assertEqual(payload["two_stage"]["stage2"]["optuna_tuning"]["n_trials"], 30)
+        self.assertTrue(bool(payload["two_stage"]["stage2_decision"]["enabled"]))
+        self.assertEqual(payload["two_stage"]["stage2_decision"]["strategy"], "enrolled_guarded_threshold")
+        self.assertFalse(bool(payload["two_stage"]["auto_balance_search"]["enabled"]))
+        self.assertEqual(
+            payload["outputs"]["results_dir"],
+            "results/exp_uct_3class_two_stage_v5_enrolled_optuna_guarded",
+        )
 
 
 if __name__ == "__main__":

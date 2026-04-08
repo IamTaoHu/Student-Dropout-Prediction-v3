@@ -28,6 +28,7 @@ class TwoStageUct3ClassClassifier:
     stage2_positive_label: int = 1
     stage2_positive_target_label: int | None = None
     class_thresholds: dict[int, float] | None = None
+    stage2_decision_config: dict[str, Any] | None = None
 
     def __post_init__(self) -> None:
         mode = str(self.decision_mode).strip().lower()
@@ -73,6 +74,7 @@ class TwoStageUct3ClassClassifier:
             raise ValueError("stage2_positive_target_label must match enrolled_label or graduate_label.")
         self._class_index = {int(label): idx for idx, label in enumerate(self.classes_)}
         self._class_threshold_vector = self._build_class_threshold_vector(self.class_thresholds)
+        self.stage2_decision_config = self._normalize_stage2_decision_config(self.stage2_decision_config)
         # Explainability/figure fallback hook.
         self.explainability_model = self.stage2_model
 
@@ -89,6 +91,26 @@ class TwoStageUct3ClassClassifier:
                 raise ValueError("class_thresholds values must be within [0.0, 1.0].")
             out[self._class_index[label]] = threshold
         return out
+
+    @staticmethod
+    def _normalize_stage2_decision_config(stage2_decision_config: dict[str, Any] | None) -> dict[str, Any]:
+        raw_cfg = stage2_decision_config if isinstance(stage2_decision_config, dict) else {}
+        strategy = str(raw_cfg.get("strategy", "argmax")).strip().lower()
+        enabled = bool(raw_cfg.get("enabled", False)) and strategy == "enrolled_guarded_threshold"
+        threshold = float(raw_cfg.get("enrolled_probability_threshold", 0.5))
+        margin_guard = float(raw_cfg.get("graduate_margin_guard", 0.0))
+        threshold = min(max(threshold, 0.0), 1.0)
+        margin_guard = min(max(margin_guard, 0.0), 1.0)
+        normalized = dict(raw_cfg)
+        normalized.update(
+            {
+                "enabled": enabled,
+                "strategy": strategy if enabled else "argmax",
+                "enrolled_probability_threshold": threshold,
+                "graduate_margin_guard": margin_guard,
+            }
+        )
+        return normalized
 
     @staticmethod
     def _as_dataframe(X: pd.DataFrame | np.ndarray | list[list[float]]) -> pd.DataFrame:
@@ -195,6 +217,57 @@ class TwoStageUct3ClassClassifier:
             "stage2_prob_graduate": p_graduate_given_non_dropout,
         }
 
+    @staticmethod
+    def apply_stage2_decision_policy(
+        base_predictions: np.ndarray,
+        *,
+        p_enrolled_given_non_dropout: np.ndarray | None,
+        p_graduate_given_non_dropout: np.ndarray | None,
+        dropout_label: int,
+        enrolled_label: int,
+        graduate_label: int,
+        stage2_decision_config: dict[str, Any] | None = None,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        preds = np.asarray(base_predictions, dtype=int).copy()
+        reasons = np.full(preds.shape[0], "argmax", dtype=object)
+        cfg = TwoStageUct3ClassClassifier._normalize_stage2_decision_config(stage2_decision_config)
+        if not bool(cfg.get("enabled", False)):
+            reasons[preds == int(dropout_label)] = "dropout_preserved"
+            return preds, reasons.astype(str)
+
+        if p_enrolled_given_non_dropout is None or p_graduate_given_non_dropout is None:
+            reasons[preds == int(dropout_label)] = "dropout_preserved"
+            reasons[preds != int(dropout_label)] = "argmax_fallback_no_stage2_probabilities"
+            return preds, reasons.astype(str)
+
+        p_enrolled = np.asarray(p_enrolled_given_non_dropout, dtype=float)
+        p_graduate = np.asarray(p_graduate_given_non_dropout, dtype=float)
+        if p_enrolled.shape != preds.shape or p_graduate.shape != preds.shape:
+            reasons[preds == int(dropout_label)] = "dropout_preserved"
+            reasons[preds != int(dropout_label)] = "argmax_fallback_invalid_stage2_probability_shape"
+            return preds, reasons.astype(str)
+
+        threshold = float(cfg.get("enrolled_probability_threshold", 0.5))
+        margin_guard = float(cfg.get("graduate_margin_guard", 0.0))
+        non_dropout_mask = preds != int(dropout_label)
+        enrolled_mask = non_dropout_mask & (p_enrolled >= threshold) & ((p_graduate - p_enrolled) <= margin_guard)
+        graduate_mask = non_dropout_mask & (~enrolled_mask)
+
+        preds[enrolled_mask] = int(enrolled_label)
+        preds[graduate_mask] = int(graduate_label)
+        reasons[preds == int(dropout_label)] = "dropout_preserved"
+        reasons[graduate_mask] = np.where(
+            p_enrolled[graduate_mask] < threshold,
+            "graduate_preserved_below_enrolled_threshold",
+            "graduate_preserved_by_margin_guard",
+        )
+        reasons[enrolled_mask] = np.where(
+            p_graduate[enrolled_mask] > p_enrolled[enrolled_mask],
+            "enrolled_selected_within_margin_guard",
+            "enrolled_selected_by_threshold",
+        )
+        return preds.astype(int), reasons.astype(str)
+
     def _predict_soft_thresholded(self, fused_proba: np.ndarray) -> np.ndarray:
         return self.predict_from_fused_probabilities(
             fused_proba=fused_proba,
@@ -212,6 +285,9 @@ class TwoStageUct3ClassClassifier:
         graduate_label: int,
         low_threshold: float,
         high_threshold: float,
+        p_enrolled_given_non_dropout: np.ndarray | None = None,
+        p_graduate_given_non_dropout: np.ndarray | None = None,
+        stage2_decision_config: dict[str, Any] | None = None,
     ) -> tuple[np.ndarray, np.ndarray]:
         if low_threshold < 0.0 or low_threshold > 1.0:
             raise ValueError("low_threshold must be within [0.0, 1.0].")
@@ -253,6 +329,15 @@ class TwoStageUct3ClassClassifier:
             middle_pred_idx = np.argmax(fused_proba[middle_band_mask], axis=1)
             preds[middle_band_mask] = classes_arr[middle_pred_idx]
             regions[middle_band_mask] = "middle_band"
+        preds, _ = TwoStageUct3ClassClassifier.apply_stage2_decision_policy(
+            preds,
+            p_enrolled_given_non_dropout=p_enrolled_given_non_dropout,
+            p_graduate_given_non_dropout=p_graduate_given_non_dropout,
+            dropout_label=int(dropout_label),
+            enrolled_label=int(enrolled_label),
+            graduate_label=int(graduate_label),
+            stage2_decision_config=stage2_decision_config,
+        )
         return preds, regions.astype(str)
 
     @staticmethod
@@ -264,6 +349,9 @@ class TwoStageUct3ClassClassifier:
         enrolled_label: int,
         graduate_label: int,
         dropout_threshold: float,
+        p_enrolled_given_non_dropout: np.ndarray | None = None,
+        p_graduate_given_non_dropout: np.ndarray | None = None,
+        stage2_decision_config: dict[str, Any] | None = None,
     ) -> np.ndarray:
         if fused_proba.ndim != 2:
             raise ValueError(f"Expected fused_proba with 2 dimensions, got shape={fused_proba.shape}.")
@@ -292,6 +380,15 @@ class TwoStageUct3ClassClassifier:
             p_enrolled[~dropout_mask] >= p_graduate[~dropout_mask],
             int(enrolled_label),
             int(graduate_label),
+        )
+        preds, _ = TwoStageUct3ClassClassifier.apply_stage2_decision_policy(
+            preds,
+            p_enrolled_given_non_dropout=p_enrolled_given_non_dropout,
+            p_graduate_given_non_dropout=p_graduate_given_non_dropout,
+            dropout_label=int(dropout_label),
+            enrolled_label=int(enrolled_label),
+            graduate_label=int(graduate_label),
+            stage2_decision_config=stage2_decision_config,
         )
         return preds
 
@@ -343,17 +440,39 @@ class TwoStageUct3ClassClassifier:
                 int(self.graduate_label),
                 int(self.enrolled_label),
             )
-            return np.where(
+            pred = np.where(
                 p_dropout >= float(self.threshold_stage1),
                 int(self.dropout_label),
                 mapped_stage2,
             ).astype(int)
+            pred, _ = self.apply_stage2_decision_policy(
+                pred,
+                p_enrolled_given_non_dropout=p_enrolled_given_non_dropout,
+                p_graduate_given_non_dropout=p_graduate_given_non_dropout,
+                dropout_label=int(self.dropout_label),
+                enrolled_label=int(self.enrolled_label),
+                graduate_label=int(self.graduate_label),
+                stage2_decision_config=self.stage2_decision_config,
+            )
+            return pred.astype(int)
 
         fused_proba = self.predict_proba(X_df)
         if self.decision_mode in {"soft_fusion", "pure_soft_argmax"}:
             pred_idx = np.argmax(fused_proba, axis=1)
-            return self.classes_[pred_idx].astype(int)
+            pred = self.classes_[pred_idx].astype(int)
+            p_enrolled_given_non_dropout, p_graduate_given_non_dropout = self._stage2_enrolled_graduate_probability(X_df)
+            pred, _ = self.apply_stage2_decision_policy(
+                pred,
+                p_enrolled_given_non_dropout=p_enrolled_given_non_dropout,
+                p_graduate_given_non_dropout=p_graduate_given_non_dropout,
+                dropout_label=int(self.dropout_label),
+                enrolled_label=int(self.enrolled_label),
+                graduate_label=int(self.graduate_label),
+                stage2_decision_config=self.stage2_decision_config,
+            )
+            return pred.astype(int)
         if self.decision_mode == "soft_fusion_with_dropout_threshold":
+            p_enrolled_given_non_dropout, p_graduate_given_non_dropout = self._stage2_enrolled_graduate_probability(X_df)
             return self.predict_with_dropout_threshold_from_fused_probabilities(
                 fused_proba=fused_proba,
                 classes=self.classes_,
@@ -361,8 +480,12 @@ class TwoStageUct3ClassClassifier:
                 enrolled_label=int(self.enrolled_label),
                 graduate_label=int(self.graduate_label),
                 dropout_threshold=float(self.threshold_stage1),
+                p_enrolled_given_non_dropout=p_enrolled_given_non_dropout,
+                p_graduate_given_non_dropout=p_graduate_given_non_dropout,
+                stage2_decision_config=self.stage2_decision_config,
             ).astype(int)
         if self.decision_mode == "soft_fusion_with_middle_band":
+            p_enrolled_given_non_dropout, p_graduate_given_non_dropout = self._stage2_enrolled_graduate_probability(X_df)
             pred, _ = self.predict_with_middle_band_from_fused_probabilities(
                 fused_proba=fused_proba,
                 classes=self.classes_,
@@ -371,6 +494,20 @@ class TwoStageUct3ClassClassifier:
                 graduate_label=int(self.graduate_label),
                 low_threshold=float(self.threshold_stage1_low),
                 high_threshold=float(self.threshold_stage1_high),
+                p_enrolled_given_non_dropout=p_enrolled_given_non_dropout,
+                p_graduate_given_non_dropout=p_graduate_given_non_dropout,
+                stage2_decision_config=self.stage2_decision_config,
             )
             return pred.astype(int)
-        return self._predict_soft_thresholded(fused_proba).astype(int)
+        pred = self._predict_soft_thresholded(fused_proba).astype(int)
+        p_enrolled_given_non_dropout, p_graduate_given_non_dropout = self._stage2_enrolled_graduate_probability(X_df)
+        pred, _ = self.apply_stage2_decision_policy(
+            pred,
+            p_enrolled_given_non_dropout=p_enrolled_given_non_dropout,
+            p_graduate_given_non_dropout=p_graduate_given_non_dropout,
+            dropout_label=int(self.dropout_label),
+            enrolled_label=int(self.enrolled_label),
+            graduate_label=int(self.graduate_label),
+            stage2_decision_config=self.stage2_decision_config,
+        )
+        return pred.astype(int)
