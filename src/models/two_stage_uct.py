@@ -29,6 +29,8 @@ class TwoStageUct3ClassClassifier:
     stage2_positive_target_label: int | None = None
     class_thresholds: dict[int, float] | None = None
     stage2_decision_config: dict[str, Any] | None = None
+    stage1_feature_columns: list[str] | None = None
+    stage2_feature_columns: list[str] | None = None
 
     def __post_init__(self) -> None:
         mode = str(self.decision_mode).strip().lower()
@@ -122,6 +124,24 @@ class TwoStageUct3ClassClassifier:
         return pd.DataFrame(arr, columns=[f"feature_{i}" for i in range(arr.shape[1])])
 
     @staticmethod
+    def _select_stage_features(
+        X: pd.DataFrame,
+        feature_columns: list[str] | None,
+        *,
+        stage_name: str,
+    ) -> pd.DataFrame:
+        if not feature_columns:
+            return X
+        missing = [col for col in feature_columns if col not in X.columns]
+        if missing:
+            preview = missing[:10]
+            raise ValueError(
+                f"{stage_name} missing required feature columns: {preview}"
+                + (" ..." if len(missing) > 10 else "")
+            )
+        return X.loc[:, feature_columns]
+
+    @staticmethod
     def _resolve_probability_column(
         proba: np.ndarray,
         classes: np.ndarray | None,
@@ -144,7 +164,8 @@ class TwoStageUct3ClassClassifier:
         return proba[:, 1]
 
     def _stage1_dropout_probability(self, X: pd.DataFrame) -> np.ndarray:
-        proba = np.asarray(self.stage1_model.predict_proba(X), dtype=float)
+        X_stage1 = self._select_stage_features(X, self.stage1_feature_columns, stage_name="stage1")
+        proba = np.asarray(self.stage1_model.predict_proba(X_stage1), dtype=float)
         classes = getattr(self.stage1_model, "classes_", None)
         p_dropout = self._resolve_probability_column(
             proba=proba,
@@ -154,7 +175,8 @@ class TwoStageUct3ClassClassifier:
         return np.clip(p_dropout, 0.0, 1.0)
 
     def _stage2_enrolled_graduate_probability(self, X: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:
-        proba = np.asarray(self.stage2_model.predict_proba(X), dtype=float)
+        X_stage2 = self._select_stage_features(X, self.stage2_feature_columns, stage_name="stage2")
+        proba = np.asarray(self.stage2_model.predict_proba(X_stage2), dtype=float)
         classes = getattr(self.stage2_model, "classes_", None)
         p_positive_given_non_dropout = self._resolve_probability_column(
             proba=proba,

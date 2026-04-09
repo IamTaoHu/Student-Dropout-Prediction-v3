@@ -1,0 +1,223 @@
+experiment:
+  id: exp_uct_3class_two_stage_v7_enrolled_interaction_prototype
+  mode: two_stage
+  seed: 42
+  dataset_config: configs/datasets/uct_student.yaml
+  target_formulation: three_class
+
+pipeline:
+  task_type: two_stage_multiclass
+  final_classes: [dropout, enrolled, graduate]
+
+target:
+  class_order: [Dropout, Enrolled, Graduate]
+
+target_mapping_override:
+  three_class:
+    Dropout: 0
+    Enrolled: 1
+    Graduate: 2
+
+splits:
+  test_size: 0.20
+  validation_size: 0.20
+  stratify_column: target
+
+preprocessing:
+  drop_missing_rows: true
+  missing_values:
+    drop_rows: true
+  imputation: median_mode
+  encoding: onehot
+  scaling: standard
+  require_onehot_encoding: true
+  outlier:
+    enabled: true
+    method: isolation_forest
+  balancing:
+    enabled: true
+    method: smote
+
+feature_engineering:
+  dataset_features:
+    derive_safe_features: true
+
+models:
+  candidates:
+    - catboost
+    - svm
+    - gradient_boosting
+  tuning:
+    backend: optuna
+    n_trials: 8
+    cv_folds: 3
+    scoring: macro_f1
+    objective_source: validation
+    objective_metric: macro_f1
+    per_model_n_trials:
+      catboost: 8
+      svm: 6
+      gradient_boosting: 5
+    search_space_overrides:
+      svm:
+        kernel_choices: [rbf]
+        kernel_params:
+          rbf:
+            C:
+              low: 0.25
+              high: 16.0
+              log: true
+            gamma:
+              low: 0.001
+              high: 1.0
+              log: true
+        shrinking_choices: [true]
+        tol:
+          low: 0.0001
+          high: 0.01
+          log: true
+        class_weight_choices: [null, balanced]
+  retrain_on_full_train_split: true
+
+evaluation:
+  metrics:
+    - accuracy
+    - macro_f1
+    - weighted_f1
+    - balanced_accuracy
+    - macro_precision
+    - macro_recall
+  compare_default_argmax: true
+  decision_rule: model_predict
+  save_confusion_matrix: true
+  save_classification_report: true
+  cross_validation:
+    enabled: true
+    n_splits: 5
+    shuffle: true
+    random_state: 42
+
+selection:
+  primary: macro_f1
+  tie_breakers:
+    - balanced_accuracy
+    - accuracy
+
+metrics:
+  primary: macro_f1
+  secondary:
+    - accuracy
+    - weighted_f1
+    - balanced_accuracy
+    - macro_precision
+    - macro_recall
+
+two_stage:
+  enabled: true
+
+  stage1:
+    name: dropout_vs_non_dropout
+    positive_class: dropout
+    negative_group: [enrolled, graduate]
+    threshold_mode: fixed
+    dropout_threshold: 0.55
+    stage1_dropout_threshold_low: 0.30
+    stage1_dropout_threshold_high: 0.55
+    class_weight_mode: balanced
+
+  stage2:
+    name: enrolled_vs_graduate
+    classes: [enrolled, graduate]
+    class_weight_mode: custom
+    class_weight_map:
+      enrolled: 1.0
+      graduate: 1.0
+    feature_sharpening:
+      enabled: true
+      groups:
+        - grade_drift
+        - approval_ratio
+        - eval_mismatch
+        - continuity
+        - stability
+        - enrolled_middle_state
+        - cross_sem_interactions
+    advanced_enrolled_separation:
+      enabled: true
+      interaction_features:
+        enabled: true
+        groups:
+          - multiplicative
+          - difference_conditioned
+          - ratio_cross
+          - flag_conditioned
+          - limited_polynomial
+      prototype_distance:
+        enabled: true
+        metric_set:
+          - l1
+          - l2
+          - margin
+          - inverse_similarity
+          - normalized
+    optuna_tuning:
+      enabled: true
+      method: optuna
+      n_trials: 10
+      sampler: tpe
+      direction: maximize
+      retrain_per_trial: true
+      objective:
+        type: enrolled_guarded_macro_f1
+        alpha: 0.35
+        beta: 1.20
+      search_space:
+        enrolled_class_weight_scale:
+          type: float
+          low: 1.0
+          high: 1.8
+        enrolled_probability_threshold:
+          type: float
+          low: 0.36
+          high: 0.52
+        graduate_margin_guard:
+          type: float
+          low: 0.00
+          high: 0.08
+
+  final_decision:
+    mode: soft_fusion_with_middle_band
+    middle_band_enabled: true
+    middle_band_behavior: force_stage2_soft_fusion
+
+  stage2_positive_class: enrolled
+
+  stage2_decision:
+    enabled: true
+    strategy: enrolled_guarded_threshold
+    enrolled_probability_threshold: 0.42
+    graduate_margin_guard: 0.06
+    tune_on_validation: true
+    log_selection: true
+    search:
+      enrolled_probability_threshold:
+        min: 0.36
+        max: 0.52
+        step: 0.02
+      graduate_margin_guard:
+        min: 0.00
+        max: 0.08
+        step: 0.02
+    objective:
+      name: macro_f1_plus_enrolled_gain_with_graduate_guard
+      enrolled_f1_alpha: 0.35
+      graduate_f1_penalty_beta: 1.20
+
+  auto_balance_search:
+    enabled: false
+
+outputs:
+  results_dir: results/exp_uct_3class_two_stage_v7_enrolled_interaction_prototype
+  runtime_artifact_format: csv
+  mirror_benchmark_outputs_to_runtime: true
+  save_artifact_manifest: true

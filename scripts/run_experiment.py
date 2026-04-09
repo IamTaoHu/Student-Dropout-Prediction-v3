@@ -26,6 +26,16 @@ if str(ROOT) not in sys.path:
 from src.data.adapters.oulad_adapter import adapt_oulad_schema
 from src.data.adapters.uct_student_adapter import adapt_uct_student_schema
 from src.data.feature_builders.oulad_paper_features import build_oulad_paper_features
+from src.data.feature_builders.uct_stage2_feature_sharpening import (
+    DEFAULT_STAGE2_FEATURE_GROUPS,
+    build_stage2_feature_sharpening_split_data,
+)
+from src.data.feature_builders.uct_stage2_advanced_features import (
+    DEFAULT_INTERACTION_GROUPS,
+    DEFAULT_PROTOTYPE_METRIC_SET,
+    build_stage2_interaction_split_data,
+    build_stage2_prototype_distance_features,
+)
 from src.data.feature_builders.uct_student_features import build_uct_student_features
 from src.data.loaders.oulad_loader import load_oulad_tables
 from src.data.loaders.uct_student_loader import load_uct_student_dataframe
@@ -61,6 +71,9 @@ from src.reporting.threshold_tuning import run_threshold_tuning_experiment
 
 DATASET_NAME_ALIASES = {
     "uct": "uct_student",
+    "uci": "uct_student",
+    "uci_student": "uct_student",
+    "uci-student": "uct_student",
     "uct_student": "uct_student",
     "uct-student": "uct_student",
     "oulad": "oulad",
@@ -264,6 +277,7 @@ def _persist_runtime_artifacts(
     trained_models: dict[str, Any],
     preprocessing_artifacts: Any,
     summary: dict[str, Any],
+    runtime_artifact_overrides_by_model: dict[str, dict[str, Any]] | None = None,
     file_format: str = "parquet",
 ) -> dict[str, str]:
     runtime_dir = output_dir / "runtime_artifacts"
@@ -281,10 +295,21 @@ def _persist_runtime_artifacts(
         joblib.dump(transformer, transformer_path)
         artifact_paths["preprocessing_transformer"] = str(transformer_path)
 
+    override_payload: dict[str, Any] = {}
+    if best_model_name and isinstance(runtime_artifact_overrides_by_model, dict):
+        override_payload = runtime_artifact_overrides_by_model.get(best_model_name, {}) or {}
+    X_train_runtime = override_payload.get("X_train", preprocessing_artifacts.X_train)
+    X_valid_runtime = override_payload.get("X_valid", preprocessing_artifacts.X_valid)
+    X_test_runtime = override_payload.get("X_test", preprocessing_artifacts.X_test)
+    runtime_feature_names = override_payload.get(
+        "feature_names",
+        preprocessing_artifacts.metadata.get("output_feature_names", []),
+    )
+
     ext = ".csv" if str(file_format).strip().lower() == "csv" else ".parquet"
-    X_train_path = _save_dataframe(preprocessing_artifacts.X_train, runtime_dir / f"X_train_preprocessed{ext}")
-    X_valid_path = _save_dataframe(preprocessing_artifacts.X_valid, runtime_dir / f"X_valid_preprocessed{ext}")
-    X_test_path = _save_dataframe(preprocessing_artifacts.X_test, runtime_dir / f"X_test_preprocessed{ext}")
+    X_train_path = _save_dataframe(X_train_runtime, runtime_dir / f"X_train_preprocessed{ext}")
+    X_valid_path = _save_dataframe(X_valid_runtime, runtime_dir / f"X_valid_preprocessed{ext}")
+    X_test_path = _save_dataframe(X_test_runtime, runtime_dir / f"X_test_preprocessed{ext}")
     y_train_path = _save_series(preprocessing_artifacts.y_train, runtime_dir / f"y_train{ext}")
     y_valid_path = _save_series(preprocessing_artifacts.y_valid, runtime_dir / f"y_valid{ext}")
     y_test_path = _save_series(preprocessing_artifacts.y_test, runtime_dir / f"y_test{ext}")
@@ -307,7 +332,7 @@ def _persist_runtime_artifacts(
         "target_formulation": summary.get("target_formulation"),
         "class_metadata": summary.get("class_metadata", {}),
         "best_model": best_model_name,
-        "feature_names": preprocessing_artifacts.metadata.get("output_feature_names", []),
+        "feature_names": runtime_feature_names,
         "class_weight": summary.get("class_weight", {}),
         "threshold_tuning": summary.get("threshold_tuning", {}),
         "best_model_threshold_tuning": (
@@ -863,6 +888,245 @@ def _resolve_experiment_feature_config(
             dataset_feature_overrides,
         )
     return resolved
+
+
+def _resolve_two_stage_stage2_feature_sharpening_config(two_stage_cfg: dict[str, Any]) -> dict[str, Any]:
+    stage2_cfg = two_stage_cfg.get("stage2", {}) if isinstance(two_stage_cfg.get("stage2", {}), dict) else {}
+    raw_cfg = (
+        stage2_cfg.get("feature_sharpening", {})
+        if isinstance(stage2_cfg.get("feature_sharpening", {}), dict)
+        else {}
+    )
+    enabled = bool(raw_cfg.get("enabled", False))
+    raw_groups = raw_cfg.get("groups", [])
+    groups: list[str] = []
+    if isinstance(raw_groups, list):
+        for item in raw_groups:
+            group = str(item).strip().lower()
+            if group and group not in groups:
+                groups.append(group)
+    if enabled and not groups:
+        groups = list(DEFAULT_STAGE2_FEATURE_GROUPS)
+    return {
+        "enabled": enabled,
+        "groups": groups,
+        "default_groups": list(DEFAULT_STAGE2_FEATURE_GROUPS),
+    }
+
+
+def _resolve_two_stage_stage2_advanced_config(two_stage_cfg: dict[str, Any]) -> dict[str, Any]:
+    stage2_cfg = two_stage_cfg.get("stage2", {}) if isinstance(two_stage_cfg.get("stage2", {}), dict) else {}
+    raw_cfg = (
+        stage2_cfg.get("advanced_enrolled_separation", {})
+        if isinstance(stage2_cfg.get("advanced_enrolled_separation", {}), dict)
+        else {}
+    )
+    enabled = bool(raw_cfg.get("enabled", False))
+
+    interaction_raw = (
+        raw_cfg.get("interaction_features", {})
+        if isinstance(raw_cfg.get("interaction_features", {}), dict)
+        else {}
+    )
+    interaction_enabled = enabled and bool(interaction_raw.get("enabled", False))
+    interaction_groups: list[str] = []
+    if isinstance(interaction_raw.get("groups", []), list):
+        for item in interaction_raw.get("groups", []):
+            group = str(item).strip().lower()
+            if group and group not in interaction_groups:
+                interaction_groups.append(group)
+    if interaction_enabled and not interaction_groups:
+        interaction_groups = list(DEFAULT_INTERACTION_GROUPS)
+
+    prototype_raw = (
+        raw_cfg.get("prototype_distance", {})
+        if isinstance(raw_cfg.get("prototype_distance", {}), dict)
+        else {}
+    )
+    prototype_enabled = enabled and bool(prototype_raw.get("enabled", False))
+    prototype_metric_set: list[str] = []
+    if isinstance(prototype_raw.get("metric_set", []), list):
+        for item in prototype_raw.get("metric_set", []):
+            metric = str(item).strip().lower()
+            if metric and metric not in prototype_metric_set:
+                prototype_metric_set.append(metric)
+    if prototype_enabled and not prototype_metric_set:
+        prototype_metric_set = list(DEFAULT_PROTOTYPE_METRIC_SET)
+
+    return {
+        "enabled": enabled,
+        "interaction_features": {
+            "enabled": interaction_enabled,
+            "groups": interaction_groups,
+            "default_groups": list(DEFAULT_INTERACTION_GROUPS),
+        },
+        "prototype_distance": {
+            "enabled": prototype_enabled,
+            "metric_set": prototype_metric_set,
+            "default_metric_set": list(DEFAULT_PROTOTYPE_METRIC_SET),
+        },
+    }
+
+
+def _prepare_two_stage_stage2_feature_bundle(
+    *,
+    two_stage_cfg: dict[str, Any],
+    splits: dict[str, pd.DataFrame],
+    preprocess_cfg: dict[str, Any],
+) -> dict[str, Any]:
+    feature_cfg = _resolve_two_stage_stage2_feature_sharpening_config(two_stage_cfg)
+    advanced_cfg = _resolve_two_stage_stage2_advanced_config(two_stage_cfg)
+    requested_groups = list(feature_cfg.get("groups", []))
+    interaction_cfg = advanced_cfg.get("interaction_features", {})
+    prototype_cfg = advanced_cfg.get("prototype_distance", {})
+    requested_interaction_groups = list(interaction_cfg.get("groups", [])) if isinstance(interaction_cfg, dict) else []
+    print(
+        "[two_stage][stage2][feature_sharpening] "
+        f"enabled={bool(feature_cfg.get('enabled', False))} "
+        f"requested_groups={requested_groups if requested_groups else []}"
+    )
+    print(
+        "[two_stage][stage2][advanced_enrolled_separation] "
+        f"enabled={bool(advanced_cfg.get('enabled', False))} "
+        f"interaction_enabled={bool(interaction_cfg.get('enabled', False))} "
+        f"interaction_groups={requested_interaction_groups if requested_interaction_groups else []} "
+        f"prototype_distance_enabled={bool(prototype_cfg.get('enabled', False))} "
+        f"prototype_metric_set={list(prototype_cfg.get('metric_set', [])) if isinstance(prototype_cfg, dict) else []}"
+    )
+    if not bool(feature_cfg.get("enabled", False)) and not bool(interaction_cfg.get("enabled", False)):
+        return {
+            "enabled": False,
+            "requested_groups": requested_groups,
+            "advanced_requested_groups": requested_interaction_groups,
+            "report": {
+                "enabled": False,
+                "requested_groups": requested_groups,
+                "advanced_enrolled_separation_enabled": bool(advanced_cfg.get("enabled", False)),
+                "interaction_features_enabled": bool(interaction_cfg.get("enabled", False)),
+                "prototype_distance_enabled": bool(prototype_cfg.get("enabled", False)),
+                "interaction_requested_groups": requested_interaction_groups,
+                "prototype_metric_set": list(prototype_cfg.get("metric_set", [])) if isinstance(prototype_cfg, dict) else [],
+                "default_groups": list(feature_cfg.get("default_groups", [])),
+                "created_features": [],
+                "created_feature_count": 0,
+                "created_features_by_group": {},
+                "skipped_features_by_group": {},
+                "feature_sharpening": {"enabled": False},
+                "interaction_features": {"enabled": False},
+                "prototype_distance": {
+                    "enabled": bool(prototype_cfg.get("enabled", False)),
+                    "metric_set": list(prototype_cfg.get("metric_set", [])) if isinstance(prototype_cfg, dict) else [],
+                },
+            },
+        }
+
+    preprocess_cfg_stage2 = dict(preprocess_cfg)
+    preprocess_cfg_stage2["target_column"] = "target"
+    preprocess_cfg_stage2["id_columns"] = []
+    combined_stage2_frames: dict[str, list[pd.DataFrame]] = {"train": [], "valid": [], "test": []}
+
+    sharpening_report: dict[str, Any] = {"enabled": False}
+    if bool(feature_cfg.get("enabled", False)):
+        split_features, sharpening_report = build_stage2_feature_sharpening_split_data(
+            splits,
+            target_column="target",
+            feature_cfg=feature_cfg,
+        )
+        stage2_artifacts = run_tabular_preprocessing(split_features, preprocess_cfg_stage2)
+        for split_name, df_key in (("train", "X_train"), ("valid", "X_valid"), ("test", "X_test")):
+            combined_stage2_frames[split_name].append(getattr(stage2_artifacts, df_key).reset_index(drop=True))
+        created_groups = {
+            group: len(names)
+            for group, names in (sharpening_report.get("created_features_by_group", {}) if isinstance(sharpening_report, dict) else {}).items()
+        }
+        skipped_groups = {
+            group: len(names)
+            for group, names in (sharpening_report.get("skipped_features_by_group", {}) if isinstance(sharpening_report, dict) else {}).items()
+        }
+        print(
+            "[two_stage][stage2][feature_sharpening] "
+            f"created_feature_count={int(sharpening_report.get('created_feature_count', 0))} "
+            f"created_features={sharpening_report.get('created_features', [])}"
+        )
+        print(
+            "[two_stage][stage2][feature_sharpening] "
+            f"created_by_group={created_groups} "
+            f"skipped_by_group={skipped_groups}"
+        )
+
+    interaction_report: dict[str, Any] = {"enabled": False}
+    if bool(interaction_cfg.get("enabled", False)):
+        interaction_splits, interaction_report = build_stage2_interaction_split_data(
+            splits,
+            target_column="target",
+            feature_cfg=interaction_cfg,
+        )
+        interaction_artifacts = run_tabular_preprocessing(interaction_splits, preprocess_cfg_stage2)
+        for split_name, df_key in (("train", "X_train"), ("valid", "X_valid"), ("test", "X_test")):
+            combined_stage2_frames[split_name].append(getattr(interaction_artifacts, df_key).reset_index(drop=True))
+        created_groups = {
+            group: len(names)
+            for group, names in (interaction_report.get("created_features_by_group", {}) if isinstance(interaction_report, dict) else {}).items()
+        }
+        skipped_groups = {
+            group: len(names)
+            for group, names in (interaction_report.get("skipped_features_by_group", {}) if isinstance(interaction_report, dict) else {}).items()
+        }
+        print(
+            "[two_stage][stage2][interaction_features] "
+            f"created_feature_count={int(interaction_report.get('created_feature_count', 0))} "
+            f"created_features={interaction_report.get('created_features', [])}"
+        )
+        print(
+            "[two_stage][stage2][interaction_features] "
+            f"created_by_group={created_groups} "
+            f"skipped_by_group={skipped_groups}"
+        )
+
+    aggregated_train = pd.concat(combined_stage2_frames["train"], axis=1) if combined_stage2_frames["train"] else pd.DataFrame(index=splits["train"].index)
+    aggregated_valid = pd.concat(combined_stage2_frames["valid"], axis=1) if combined_stage2_frames["valid"] else pd.DataFrame(index=splits["valid"].index)
+    aggregated_test = pd.concat(combined_stage2_frames["test"], axis=1) if combined_stage2_frames["test"] else pd.DataFrame(index=splits["test"].index)
+    combined_created_features = list(sharpening_report.get("created_features", [])) + list(interaction_report.get("created_features", []))
+    report = {
+        "enabled": True,
+        "requested_groups": requested_groups,
+        "interaction_requested_groups": requested_interaction_groups,
+        "advanced_enrolled_separation_enabled": bool(advanced_cfg.get("enabled", False)),
+        "interaction_features_enabled": bool(interaction_cfg.get("enabled", False)),
+        "prototype_distance_enabled": bool(prototype_cfg.get("enabled", False)),
+        "prototype_metric_set": list(prototype_cfg.get("metric_set", [])) if isinstance(prototype_cfg, dict) else [],
+        "default_groups": list(feature_cfg.get("default_groups", [])),
+        "created_features": combined_created_features,
+        "created_feature_count": int(len(combined_created_features)),
+        "created_features_by_group": {
+            **(sharpening_report.get("created_features_by_group", {}) if isinstance(sharpening_report, dict) else {}),
+            **(interaction_report.get("created_features_by_group", {}) if isinstance(interaction_report, dict) else {}),
+        },
+        "skipped_features_by_group": {
+            **(sharpening_report.get("skipped_features_by_group", {}) if isinstance(sharpening_report, dict) else {}),
+            **(interaction_report.get("skipped_features_by_group", {}) if isinstance(interaction_report, dict) else {}),
+        },
+        "source_columns": {
+            "feature_sharpening": sharpening_report.get("source_columns", {}) if isinstance(sharpening_report, dict) else {},
+            "interaction_features": interaction_report.get("source_columns", {}) if isinstance(interaction_report, dict) else {},
+        },
+        "feature_sharpening": sharpening_report,
+        "interaction_features": interaction_report,
+        "prototype_distance": {
+            "enabled": bool(prototype_cfg.get("enabled", False)),
+            "metric_set": list(prototype_cfg.get("metric_set", [])) if isinstance(prototype_cfg, dict) else [],
+        },
+    }
+    return {
+        "enabled": True,
+        "requested_groups": requested_groups,
+        "advanced_requested_groups": requested_interaction_groups,
+        "report": report,
+        "X_train": aggregated_train.reset_index(drop=True),
+        "X_valid": aggregated_valid.reset_index(drop=True),
+        "X_test": aggregated_test.reset_index(drop=True),
+        "feature_names": list(aggregated_train.columns),
+    }
 
 
 def _resolve_per_model_trial_budgets(
@@ -4434,6 +4698,11 @@ def _run_two_stage_uct_model(
     threshold_tuning_cfg: dict[str, Any],
     calibration_cfg: dict[str, dict[str, Any]],
     output_dir: Path,
+    X_train_stage2_base: pd.DataFrame | None = None,
+    y_train_stage2_base: pd.Series | None = None,
+    outlier_cfg: dict[str, Any] | None = None,
+    balancing_cfg: dict[str, Any] | None = None,
+    stage2_feature_bundle: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], Any, float | None, dict[str, Any], dict[str, str] | None]:
     dropout_idx, enrolled_idx, graduate_idx = _resolve_uct_three_class_indices(class_metadata)
     stage2_positive_target_label = _resolve_two_stage_stage2_positive_target_label(
@@ -4441,29 +4710,45 @@ def _run_two_stage_uct_model(
         enrolled_idx=enrolled_idx,
         graduate_idx=graduate_idx,
     )
+    feature_bundle = stage2_feature_bundle if isinstance(stage2_feature_bundle, dict) else {}
+    stage2_feature_engineering_enabled = bool(feature_bundle.get("enabled", False))
+    stage2_requested_groups = list(feature_bundle.get("requested_groups", [])) if stage2_feature_engineering_enabled else []
+    stage2_requested_interaction_groups = (
+        list(feature_bundle.get("advanced_requested_groups", []))
+        if stage2_feature_engineering_enabled
+        else []
+    )
+    advanced_stage2_cfg = _resolve_two_stage_stage2_advanced_config(
+        two_stage_cfg if isinstance(two_stage_cfg, dict) else {}
+    )
+    interaction_cfg = advanced_stage2_cfg.get("interaction_features", {})
+    prototype_cfg = advanced_stage2_cfg.get("prototype_distance", {})
+
+    X_train_stage2_source = X_train_stage2_base if isinstance(X_train_stage2_base, pd.DataFrame) else X_train
+    y_train_stage2_source = y_train_stage2_base if isinstance(y_train_stage2_base, pd.Series) else y_train
 
     y_train_stage1 = (y_train == dropout_idx).astype(int)
     y_valid_stage1 = (y_valid == dropout_idx).astype(int)
     y_test_stage1 = (y_test == dropout_idx).astype(int)
 
-    train_mask_stage2 = y_train != dropout_idx
+    train_mask_stage2 = y_train_stage2_source != dropout_idx
     valid_mask_stage2 = y_valid != dropout_idx
     test_mask_stage2 = y_test != dropout_idx
 
     if int(train_mask_stage2.sum()) == 0:
         raise ValueError("No non-dropout samples available for stage2 training.")
-    X_train_stage2 = X_train.loc[train_mask_stage2].reset_index(drop=True)
-    X_valid_stage2 = X_valid.loc[valid_mask_stage2].reset_index(drop=True)
-    X_test_stage2 = X_test.loc[test_mask_stage2].reset_index(drop=True)
+    X_train_stage2_base_filtered = X_train_stage2_source.loc[train_mask_stage2].reset_index(drop=True)
+    X_valid_stage2_base_filtered = X_valid.loc[valid_mask_stage2].reset_index(drop=True)
+    X_test_stage2_base_filtered = X_test.loc[test_mask_stage2].reset_index(drop=True)
     if int(stage2_positive_target_label) == int(enrolled_idx):
-        y_train_stage2 = (y_train.loc[train_mask_stage2] == enrolled_idx).astype(int).reset_index(drop=True)
+        y_train_stage2 = (y_train_stage2_source.loc[train_mask_stage2] == enrolled_idx).astype(int).reset_index(drop=True)
         y_valid_stage2 = (y_valid.loc[valid_mask_stage2] == enrolled_idx).astype(int).reset_index(drop=True)
         y_test_stage2 = (y_test.loc[test_mask_stage2] == enrolled_idx).astype(int).reset_index(drop=True)
         stage2_class_label_to_index = {"Graduate": 0, "Enrolled": 1}
         stage2_positive_label_name = "Enrolled"
         stage2_negative_label_name = "Graduate"
     else:
-        y_train_stage2 = (y_train.loc[train_mask_stage2] == graduate_idx).astype(int).reset_index(drop=True)
+        y_train_stage2 = (y_train_stage2_source.loc[train_mask_stage2] == graduate_idx).astype(int).reset_index(drop=True)
         y_valid_stage2 = (y_valid.loc[valid_mask_stage2] == graduate_idx).astype(int).reset_index(drop=True)
         y_test_stage2 = (y_test.loc[test_mask_stage2] == graduate_idx).astype(int).reset_index(drop=True)
         stage2_class_label_to_index = {"Enrolled": 0, "Graduate": 1}
@@ -4472,6 +4757,111 @@ def _run_two_stage_uct_model(
 
     if int(pd.Series(y_train_stage2).nunique()) < 2:
         raise ValueError("Stage2 training requires both Enrolled and Graduate classes in train split.")
+
+    X_train_stage2_augmented_full = X_train_stage2_source.reset_index(drop=True)
+    X_valid_stage2_augmented_full = X_valid.reset_index(drop=True)
+    X_test_stage2_augmented_full = X_test.reset_index(drop=True)
+    X_train_stage2_inference = X_train_stage2_base_filtered
+    X_valid_stage2_inference = X_valid_stage2_base_filtered
+    X_test_stage2_inference = X_test_stage2_base_filtered
+
+    stage2_feature_report = (
+        dict(feature_bundle.get("report", {}))
+        if isinstance(feature_bundle.get("report", {}), dict)
+        else {"enabled": False}
+    )
+    if stage2_feature_engineering_enabled:
+        extra_train_full = feature_bundle.get("X_train")
+        extra_valid_full = feature_bundle.get("X_valid")
+        extra_test_full = feature_bundle.get("X_test")
+        if not all(isinstance(item, pd.DataFrame) for item in (extra_train_full, extra_valid_full, extra_test_full)):
+            raise ValueError("Stage2 feature sharpening bundle is enabled but missing preprocessed feature tables.")
+        X_train_stage2_augmented_full = pd.concat(
+            [X_train_stage2_source.reset_index(drop=True), extra_train_full.reset_index(drop=True)],
+            axis=1,
+        )
+        X_valid_stage2_augmented_full = pd.concat(
+            [X_valid.reset_index(drop=True), extra_valid_full.reset_index(drop=True)],
+            axis=1,
+        )
+        X_test_stage2_augmented_full = pd.concat(
+            [X_test.reset_index(drop=True), extra_test_full.reset_index(drop=True)],
+            axis=1,
+        )
+        X_train_stage2_inference = X_train_stage2_augmented_full.loc[train_mask_stage2].reset_index(drop=True)
+        X_valid_stage2_inference = X_valid_stage2_augmented_full.loc[valid_mask_stage2].reset_index(drop=True)
+        X_test_stage2_inference = X_test_stage2_augmented_full.loc[test_mask_stage2].reset_index(drop=True)
+
+    prototype_report = (
+        dict(stage2_feature_report.get("prototype_distance", {}))
+        if isinstance(stage2_feature_report.get("prototype_distance", {}), dict)
+        else {"enabled": False}
+    )
+    if bool(prototype_cfg.get("enabled", False)):
+        prototype_splits, prototype_report = build_stage2_prototype_distance_features(
+            X_train=X_train_stage2_inference,
+            y_train=y_train_stage2,
+            X_valid=X_valid_stage2_inference,
+            X_test=X_test_stage2_inference,
+            feature_cfg=prototype_cfg,
+            enrolled_positive_label=1 if int(stage2_positive_target_label) == int(enrolled_idx) else 0,
+        )
+        train_proto = prototype_splits.get("train", pd.DataFrame(index=X_train_stage2_inference.index))
+        valid_proto = prototype_splits.get("valid", pd.DataFrame(index=X_valid_stage2_inference.index))
+        test_proto = prototype_splits.get("test", pd.DataFrame(index=X_test_stage2_inference.index))
+        if int(train_proto.shape[1]) > 0:
+            X_train_stage2_inference = pd.concat([X_train_stage2_inference.reset_index(drop=True), train_proto.reset_index(drop=True)], axis=1)
+            X_valid_stage2_inference = pd.concat([X_valid_stage2_inference.reset_index(drop=True), valid_proto.reset_index(drop=True)], axis=1)
+            X_test_stage2_inference = pd.concat([X_test_stage2_inference.reset_index(drop=True), test_proto.reset_index(drop=True)], axis=1)
+
+            train_proto_full = pd.DataFrame(np.nan, index=X_train_stage2_augmented_full.index, columns=train_proto.columns)
+            valid_proto_full = pd.DataFrame(np.nan, index=X_valid_stage2_augmented_full.index, columns=valid_proto.columns)
+            test_proto_full = pd.DataFrame(np.nan, index=X_test_stage2_augmented_full.index, columns=test_proto.columns)
+            train_proto_full.loc[np.asarray(train_mask_stage2, dtype=bool), :] = train_proto.to_numpy()
+            valid_proto_full.loc[np.asarray(valid_mask_stage2, dtype=bool), :] = valid_proto.to_numpy()
+            test_proto_full.loc[np.asarray(test_mask_stage2, dtype=bool), :] = test_proto.to_numpy()
+            X_train_stage2_augmented_full = pd.concat([X_train_stage2_augmented_full.reset_index(drop=True), train_proto_full.reset_index(drop=True)], axis=1)
+            X_valid_stage2_augmented_full = pd.concat([X_valid_stage2_augmented_full.reset_index(drop=True), valid_proto_full.reset_index(drop=True)], axis=1)
+            X_test_stage2_augmented_full = pd.concat([X_test_stage2_augmented_full.reset_index(drop=True), test_proto_full.reset_index(drop=True)], axis=1)
+
+        print(
+            "[two_stage][stage2][prototype_distance] "
+            f"enabled={bool(prototype_report.get('enabled', False))} "
+            f"created_feature_count={int(prototype_report.get('created_feature_count', 0))} "
+            f"prototype_source_columns={prototype_report.get('prototype_source_columns', [])}"
+        )
+    stage2_feature_report["prototype_distance"] = prototype_report
+    stage2_feature_report["prototype_distance_enabled"] = bool(prototype_report.get("enabled", False))
+    stage2_feature_report["prototype_metric_set"] = list(prototype_report.get("metric_set", []))
+
+    X_train_stage2 = X_train_stage2_inference
+    X_valid_stage2 = X_valid_stage2_inference
+    X_test_stage2 = X_test_stage2_inference
+    y_train_stage2_train = y_train_stage2.copy()
+    stage2_outlier_meta = {"enabled": False, "method": "disabled"}
+    stage2_balancing_meta = {"enabled": False, "method": "disabled"}
+    if stage2_feature_engineering_enabled:
+        X_train_stage2, y_train_stage2_train, stage2_outlier_meta = apply_outlier_filter(
+            X_train_stage2,
+            y_train_stage2_train,
+            outlier_cfg if isinstance(outlier_cfg, dict) else {"enabled": False},
+        )
+        X_train_stage2, y_train_stage2_train, stage2_balancing_meta = apply_balancing(
+            X_train_stage2,
+            y_train_stage2_train,
+            balancing_cfg if isinstance(balancing_cfg, dict) else {"enabled": False},
+        )
+    print(
+        "[two_stage][stage2][setup] "
+        f"model={model_name} "
+        f"feature_sharpening_enabled={bool(stage2_feature_report.get('feature_sharpening', {}).get('enabled', stage2_feature_engineering_enabled))} "
+        f"advanced_enrolled_separation_enabled={bool(advanced_stage2_cfg.get('enabled', False))} "
+        f"requested_groups={stage2_requested_groups} "
+        f"interaction_groups={stage2_requested_interaction_groups} "
+        f"prototype_distance_enabled={bool(prototype_report.get('enabled', False))} "
+        f"created_features={int(stage2_feature_report.get('created_feature_count', 0)) + int(prototype_report.get('created_feature_count', 0))} "
+        f"train_features={int(X_train_stage2.shape[1])}"
+    )
 
     stage2_decision_cfg = _resolve_two_stage_stage2_decision_config(
         two_stage_cfg if isinstance(two_stage_cfg, dict) else {}
@@ -4539,7 +4929,7 @@ def _run_two_stage_uct_model(
         params_stage2, score_stage2, details_stage2 = tune_model_with_optuna(
             model_name=model_name,
             X_train=X_train_stage2,
-            y_train=y_train_stage2,
+            y_train=y_train_stage2_train,
             tuning_cfg={
                 **tuning_cfg,
                 "seed": seed,
@@ -4582,7 +4972,7 @@ def _run_two_stage_uct_model(
         params_stage2=params_stage2,
         seed=seed,
         X_train_stage2=X_train_stage2,
-        y_train_stage2=y_train_stage2,
+        y_train_stage2=y_train_stage2_train,
         X_valid_stage2=X_valid_stage2,
         y_valid_stage2_binary=y_valid_stage2,
         y_valid_stage2_original=y_valid.loc[valid_mask_stage2].reset_index(drop=True),
@@ -4599,6 +4989,13 @@ def _run_two_stage_uct_model(
 
     eval_cfg_stage1 = {"seed": seed, "class_weight": stage1_class_weight_cfg, "label_order": [0, 1]}
     eval_cfg_stage2 = {"seed": seed, "class_weight": stage2_class_weight_cfg, "label_order": [0, 1]}
+    print(
+        "[two_stage][stage2][train_start] "
+        f"model={model_name} "
+        f"train_rows={int(len(X_train_stage2))} "
+        f"valid_rows={int(len(X_valid_stage2))} "
+        f"feature_count={int(X_train_stage2.shape[1])}"
+    )
 
     if retrain_on_full_train_split:
         stage1_prefit = train_and_evaluate(
@@ -4630,7 +5027,7 @@ def _run_two_stage_uct_model(
             model_name=model_name,
             params=params_stage2,
             X_train=X_train_stage2,
-            y_train=y_train_stage2,
+            y_train=y_train_stage2_train,
             X_valid=X_valid_stage2,
             y_valid=y_valid_stage2,
             X_test=X_test_stage2,
@@ -4638,7 +5035,7 @@ def _run_two_stage_uct_model(
             eval_config=eval_cfg_stage2,
         )
         X_stage2_full = pd.concat([X_train_stage2, X_valid_stage2], axis=0).reset_index(drop=True)
-        y_stage2_full = pd.concat([y_train_stage2, y_valid_stage2], axis=0).reset_index(drop=True)
+        y_stage2_full = pd.concat([y_train_stage2_train, y_valid_stage2], axis=0).reset_index(drop=True)
         stage2_result = retrain_on_full_train_and_evaluate_test(
             model_name=model_name,
             params=params_stage2,
@@ -4666,13 +5063,20 @@ def _run_two_stage_uct_model(
             model_name=model_name,
             params=params_stage2,
             X_train=X_train_stage2,
-            y_train=y_train_stage2,
+            y_train=y_train_stage2_train,
             X_valid=X_valid_stage2,
             y_valid=y_valid_stage2,
             X_test=X_test_stage2,
             y_test=y_test_stage2,
             eval_config=eval_cfg_stage2,
         )
+    print(
+        "[two_stage][stage2][train_end] "
+        f"model={model_name} "
+        f"status=success "
+        f"valid_macro_f1={float(stage2_result.metrics.get('valid_macro_f1', 0.0)):.4f} "
+        f"test_macro_f1={float(stage2_result.metrics.get('test_macro_f1', 0.0)):.4f}"
+    )
 
     stage1_model = stage1_result.artifacts.get("model")
     stage2_model = stage2_result.artifacts.get("model")
@@ -4716,10 +5120,12 @@ def _run_two_stage_uct_model(
         stage2_positive_target_label=stage2_positive_target_label,
         class_thresholds=class_thresholds,
         stage2_decision_config=stage2_decision_cfg,
+        stage1_feature_columns=list(X_train.columns),
+        stage2_feature_columns=list(X_train_stage2_augmented_full.columns),
     )
 
-    stage_prob_valid = combined_model.predict_stage_probabilities(X_valid)
-    stage_prob_test = combined_model.predict_stage_probabilities(X_test)
+    stage_prob_valid = combined_model.predict_stage_probabilities(X_valid_stage2_augmented_full)
+    stage_prob_test = combined_model.predict_stage_probabilities(X_test_stage2_augmented_full)
     if str(stage2_optuna_tuning_result.get("status", "")).strip().lower() == "applied":
         stage2_decision_tuning_result = dict(stage2_optuna_tuning_result)
     else:
@@ -4741,16 +5147,16 @@ def _run_two_stage_uct_model(
         else {"enabled": False, "strategy": "argmax"}
     )
     combined_model.stage2_decision_config = dict(selected_stage2_decision_cfg)
-    y_proba_valid_final = combined_model.predict_proba(X_valid)
-    y_proba_test_final = combined_model.predict_proba(X_test)
+    y_proba_valid_final = combined_model.predict_proba(X_valid_stage2_augmented_full)
+    y_proba_test_final = combined_model.predict_proba(X_test_stage2_augmented_full)
     label_order = [int(v) for v in class_metadata.get("class_indices", [dropout_idx, enrolled_idx, graduate_idx])]
     selected_dropout_threshold = float(threshold_stage1)
     selected_low_threshold = float(threshold_tuning_cfg.get("stage1_dropout_threshold_low", threshold_stage1))
     selected_high_threshold = float(threshold_tuning_cfg.get("stage1_dropout_threshold_high", threshold_stage1))
     tuned_thresholds_vec = _threshold_vector_from_map(label_order, class_thresholds)
     if decision_mode == "hard_routing":
-        y_pred_valid_final = combined_model.predict(X_valid)
-        y_pred_test_final = combined_model.predict(X_test)
+        y_pred_valid_final = combined_model.predict(X_valid_stage2_augmented_full)
+        y_pred_test_final = combined_model.predict(X_test_stage2_augmented_full)
         _, valid_stage2_decision_reason = TwoStageUct3ClassClassifier.apply_stage2_decision_policy(
             np.asarray(y_pred_valid_final, dtype=int),
             p_enrolled_given_non_dropout=np.asarray(stage_prob_valid.get("stage2_prob_enrolled", []), dtype=float),
@@ -5089,6 +5495,15 @@ def _run_two_stage_uct_model(
             "test_non_dropout_only": {k: float(v) for k, v in stage2_result.metrics.items() if str(k).startswith("test_")},
             "classification_report_valid": stage2_result.artifacts.get("classification_report_valid", {}),
             "classification_report_test": stage2_result.artifacts.get("classification_report_test", {}),
+            "outlier": stage2_outlier_meta,
+            "balancing": stage2_balancing_meta,
+            "feature_sharpening": {
+                **stage2_feature_report,
+                "enabled": stage2_feature_engineering_enabled,
+                "requested_groups": stage2_requested_groups,
+                "interaction_requested_groups": stage2_requested_interaction_groups,
+                "feature_count_seen_at_training": int(X_train_stage2.shape[1]),
+            },
             "stage2_optuna_tuning": stage2_optuna_tuning_result,
             "stage2_decision_tuning": stage2_decision_tuning_result,
         },
@@ -5134,6 +5549,15 @@ def _run_two_stage_uct_model(
             "calibration": {
                 "stage1": stage1_calibration_meta,
                 "stage2": stage2_calibration_meta,
+            },
+            "feature_sharpening": {
+                **stage2_feature_report,
+                "enabled": stage2_feature_engineering_enabled,
+                "requested_groups": stage2_requested_groups,
+                "interaction_requested_groups": stage2_requested_interaction_groups,
+                "feature_count_seen_at_training": int(X_train_stage2.shape[1]),
+                "stage1_feature_count": int(X_train.shape[1]),
+                "stage2_base_feature_count": int(X_train_stage2_source.shape[1]),
             },
             "threshold_tuning": threshold_tuning_result,
             "stage2_optuna": stage2_optuna_tuning_result,
@@ -5199,6 +5623,13 @@ def _run_two_stage_uct_model(
     payload["metrics"]["stage2_selected_graduate_weight"] = float(
         stage2_decision_tuning_result.get("selected_stage2_weights", {}).get("selected_graduate_weight", np.nan)
     )
+    payload["metrics"]["stage2_feature_sharpening_enabled"] = 1.0 if stage2_feature_engineering_enabled else 0.0
+    payload["metrics"]["stage2_feature_sharpening_created_count"] = float(
+        stage2_feature_report.get("created_feature_count", 0)
+    )
+    payload["metrics"]["stage2_prototype_distance_enabled"] = 1.0 if bool(prototype_report.get("enabled", False)) else 0.0
+    payload["metrics"]["stage2_prototype_feature_count"] = float(prototype_report.get("created_feature_count", 0))
+    payload["metrics"]["stage2_feature_count_seen_at_training"] = float(X_train_stage2.shape[1])
     payload["metrics"]["stage2_optuna_trials"] = float(
         stage2_decision_tuning_result.get("optuna", {}).get("n_trials_completed", 0)
     )
@@ -5231,6 +5662,13 @@ def _run_two_stage_uct_model(
             "P(graduate)": "(1-p_dropout) * p_graduate_given_non_dropout",
         },
         "stage2_positive_label": stage2_positive_label_name,
+        "stage2_feature_sharpening": {
+            **stage2_feature_report,
+            "enabled": stage2_feature_engineering_enabled,
+            "requested_groups": stage2_requested_groups,
+            "interaction_requested_groups": stage2_requested_interaction_groups,
+            "feature_count_seen_at_training": int(X_train_stage2.shape[1]),
+        },
     }
     calibration_metadata_payload = {
         "model": model_name,
@@ -5268,6 +5706,13 @@ def _run_two_stage_uct_model(
     two_stage_diagnostics_payload = {
         "model": model_name,
         "decision_mode": decision_mode,
+        "stage2_feature_sharpening": {
+            **stage2_feature_report,
+            "enabled": stage2_feature_engineering_enabled,
+            "requested_groups": stage2_requested_groups,
+            "interaction_requested_groups": stage2_requested_interaction_groups,
+            "feature_count_seen_at_training": int(X_train_stage2.shape[1]),
+        },
         "selected_dropout_threshold": threshold_tuning_result.get("selected_dropout_threshold"),
         "selected_low_threshold": threshold_tuning_result.get("selected_low_threshold"),
         "selected_high_threshold": threshold_tuning_result.get("selected_high_threshold"),
@@ -5375,6 +5820,13 @@ def _run_two_stage_uct_model(
     }
     if tuning_artifacts:
         payload["artifact_paths"].update(tuning_artifacts)
+    if stage2_feature_engineering_enabled or bool(prototype_report.get("enabled", False)):
+        payload["_runtime_artifact_overrides"] = {
+            "X_train": X_train_stage2_augmented_full,
+            "X_valid": X_valid_stage2_augmented_full,
+            "X_test": X_test_stage2_augmented_full,
+            "feature_names": list(X_train_stage2_augmented_full.columns),
+        }
     return payload, combined_model, tuning_score, tuning_meta, tuning_artifacts
 
 
@@ -6066,6 +6518,15 @@ def run_experiment(experiment_config_path: Path, compact_summary: bool | None = 
             "two_stage modes are only supported for dataset=uct_student and target_formulation=three_class."
         )
     two_stage_cfg = exp_cfg.get("two_stage", {}) if isinstance(exp_cfg.get("two_stage", {}), dict) else {}
+    stage2_feature_bundle = (
+        _prepare_two_stage_stage2_feature_bundle(
+            two_stage_cfg=two_stage_cfg,
+            splits=splits,
+            preprocess_cfg=preprocess_cfg,
+        )
+        if bool(two_stage_cfg.get("enabled", False))
+        else {"enabled": False, "requested_groups": [], "report": {"enabled": False}}
+    )
     resolved_stage2_decision_cfg = _resolve_two_stage_stage2_decision_config(two_stage_cfg)
     resolved_stage2_optuna_cfg = _resolve_two_stage_stage2_optuna_tuning_config(two_stage_cfg)
     resolved_two_stage_auto_balance_cfg = _resolve_two_stage_auto_balance_search_config(two_stage_cfg)
@@ -6170,6 +6631,9 @@ def run_experiment(experiment_config_path: Path, compact_summary: bool | None = 
         f"stage2_decision_strategy={resolved_stage2_decision_cfg.get('strategy', 'argmax')} "
         f"auto_balance_enabled={bool(resolved_two_stage_auto_balance_cfg.get('enabled', False))}"
     )
+    if two_stage_enabled:
+        print(f"[two_stage][stage1][candidates] models={model_candidates}")
+        print(f"[two_stage][stage2][candidates] models={model_candidates}")
     param_overrides_cfg = exp_cfg.get("models", {}).get("param_overrides", {})
     runtime_artifact_format = str(output_cfg.get("runtime_artifact_format", "parquet")).strip().lower()
 
@@ -6178,6 +6642,9 @@ def run_experiment(experiment_config_path: Path, compact_summary: bool | None = 
     trained_models: dict[str, Any] = {}
     optuna_artifacts: dict[str, dict[str, str]] = {}
     model_decision_configs: dict[str, dict[str, Any]] = {}
+    runtime_artifact_overrides_by_model: dict[str, dict[str, Any]] = {}
+    stage2_feature_counts_by_model: dict[str, int] = {}
+    stage2_advanced_reports_by_model: dict[str, dict[str, Any]] = {}
 
     for model_name in model_candidates:
         print(
@@ -6226,6 +6693,8 @@ def run_experiment(experiment_config_path: Path, compact_summary: bool | None = 
                     class_metadata=class_metadata,
                     X_train=X_train_bal,
                     y_train=y_train_bal,
+                    X_train_stage2_base=artifacts.X_train if bool(stage2_feature_bundle.get("enabled", False)) else None,
+                    y_train_stage2_base=artifacts.y_train if bool(stage2_feature_bundle.get("enabled", False)) else None,
                     X_valid=artifacts.X_valid,
                     y_valid=artifacts.y_valid,
                     X_test=artifacts.X_test,
@@ -6234,7 +6703,21 @@ def run_experiment(experiment_config_path: Path, compact_summary: bool | None = 
                     class_thresholds=two_stage_class_thresholds,
                     threshold_tuning_cfg=two_stage_threshold_tuning_cfg,
                     calibration_cfg=two_stage_calibration_cfg,
+                    outlier_cfg=outlier_cfg,
+                    balancing_cfg=balancing_cfg,
+                    stage2_feature_bundle=stage2_feature_bundle,
                     output_dir=output_dir,
+                )
+                runtime_override = payload.pop("_runtime_artifact_overrides", None)
+                if isinstance(runtime_override, dict):
+                    runtime_artifact_overrides_by_model[model_name] = runtime_override
+                stage2_feature_counts_by_model[model_name] = int(
+                    payload.get("metrics", {}).get("stage2_feature_count_seen_at_training", np.nan)
+                ) if pd.notna(payload.get("metrics", {}).get("stage2_feature_count_seen_at_training", np.nan)) else 0
+                stage2_advanced_reports_by_model[model_name] = (
+                    dict(payload.get("artifacts", {}).get("two_stage", {}).get("feature_sharpening", {}))
+                    if isinstance(payload.get("artifacts", {}).get("two_stage", {}).get("feature_sharpening", {}), dict)
+                    else {}
                 )
                 payload["class_weight"] = dict(payload.get("class_weight", {}))
                 payload["class_weight"]["class_weight_requested"] = bool(
@@ -6276,6 +6759,11 @@ def run_experiment(experiment_config_path: Path, compact_summary: bool | None = 
                     f"stage2_tuning_enabled={bool(resolved_stage2_optuna_cfg.get('enabled', False))} "
                     f"stage2_decision_strategy={resolved_stage2_decision_cfg.get('strategy', 'argmax')} "
                     f"error={type(exc).__name__}: {exc}"
+                )
+                print(
+                    "[two_stage][stage2][error] "
+                    f"model={model_name} "
+                    f"reason={type(exc).__name__}: {exc}"
                 )
             continue
         if model_tuning_enabled:
@@ -6584,6 +7072,13 @@ def run_experiment(experiment_config_path: Path, compact_summary: bool | None = 
             f"requested_models={model_candidates} "
             f"errors={error_summary}"
         )
+        if two_stage_enabled:
+            print(
+                "[two_stage][stage2][summary] "
+                "no_stage2_candidate_completed_successfully "
+                f"requested_models={model_candidates} "
+                f"errors={error_summary}"
+            )
     best_by_cv: dict[str, Any] = {"model": None, "ranking_columns": []}
     best_by_test: dict[str, Any] = {"model": None, "ranking_columns": []}
     if model_selection_cfg.get("enabled", False):
@@ -6625,6 +7120,58 @@ def run_experiment(experiment_config_path: Path, compact_summary: bool | None = 
             best_model = str(leaderboard_df.iloc[0]["model"])
         else:
             best_model = None
+
+    stage2_feature_sharpening_report_path: Path | None = None
+    stage2_advanced_feature_report_path: Path | None = None
+    if two_stage_enabled:
+        stage2_feature_report_payload = (
+            dict(stage2_feature_bundle.get("report", {}))
+            if isinstance(stage2_feature_bundle.get("report", {}), dict)
+            else {"enabled": False}
+        )
+        stage2_feature_report_payload["enabled"] = bool(stage2_feature_bundle.get("enabled", False))
+        stage2_feature_report_payload["requested_groups"] = list(stage2_feature_bundle.get("requested_groups", []))
+        stage2_feature_report_payload["interaction_requested_groups"] = list(stage2_feature_bundle.get("advanced_requested_groups", []))
+        stage2_feature_report_payload["stage1_candidate_models"] = list(model_candidates)
+        stage2_feature_report_payload["stage2_candidate_models"] = list(model_candidates)
+        stage2_feature_report_payload["per_model_stage2_feature_count"] = stage2_feature_counts_by_model
+        stage2_feature_sharpening_report_path = output_dir / "stage2_feature_sharpening_report.json"
+        stage2_feature_sharpening_report_path.write_text(
+            json.dumps(stage2_feature_report_payload, indent=2),
+            encoding="utf-8",
+        )
+        prototype_source_columns: list[str] = []
+        prototype_feature_columns: list[str] = []
+        for model_name in model_candidates:
+            model_report = stage2_advanced_reports_by_model.get(model_name, {})
+            prototype_report = (
+                model_report.get("prototype_distance", {})
+                if isinstance(model_report.get("prototype_distance", {}), dict)
+                else {}
+            )
+            for col in prototype_report.get("prototype_source_columns", []):
+                if col not in prototype_source_columns:
+                    prototype_source_columns.append(col)
+            for col in prototype_report.get("prototype_feature_columns", []):
+                if col not in prototype_feature_columns:
+                    prototype_feature_columns.append(col)
+        stage2_advanced_feature_report_payload = {
+            "feature_sharpening_enabled": bool(stage2_feature_report_payload.get("feature_sharpening", {}).get("enabled", False)),
+            "interaction_features_enabled": bool(stage2_feature_report_payload.get("interaction_features_enabled", False)),
+            "prototype_distance_enabled": bool(stage2_feature_report_payload.get("prototype_distance_enabled", False)),
+            "requested_groups": list(stage2_feature_report_payload.get("requested_groups", [])),
+            "interaction_requested_groups": list(stage2_feature_report_payload.get("interaction_requested_groups", [])),
+            "created_feature_names": list(stage2_feature_report_payload.get("created_features", [])),
+            "skipped_feature_reasons": stage2_feature_report_payload.get("skipped_features_by_group", {}),
+            "prototype_source_columns": prototype_source_columns,
+            "prototype_feature_columns": prototype_feature_columns,
+            "per_model_stage2_feature_count": stage2_feature_counts_by_model,
+        }
+        stage2_advanced_feature_report_path = output_dir / "stage2_advanced_feature_report.json"
+        stage2_advanced_feature_report_path.write_text(
+            json.dumps(stage2_advanced_feature_report_payload, indent=2),
+            encoding="utf-8",
+        )
 
     compact_mode = bool(output_cfg.get("compact_summary", False)) if compact_summary is None else bool(compact_summary)
     summary = {
@@ -6674,6 +7221,12 @@ def run_experiment(experiment_config_path: Path, compact_summary: bool | None = 
         "decision_policy": decision_rule_cfg,
         "summary_mode": "compact" if compact_mode else "full",
     }
+    if two_stage_enabled:
+        summary["two_stage_feature_sharpening"] = (
+            dict(stage2_feature_bundle.get("report", {}))
+            if isinstance(stage2_feature_bundle.get("report", {}), dict)
+            else {"enabled": False}
+        )
     if best_by_cv.get("model") is not None:
         summary["best_by_cv"] = best_by_cv
     if best_by_test.get("model") is not None:
@@ -6726,6 +7279,7 @@ def run_experiment(experiment_config_path: Path, compact_summary: bool | None = 
         trained_models=trained_models,
         preprocessing_artifacts=artifacts,
         summary=summary,
+        runtime_artifact_overrides_by_model=runtime_artifact_overrides_by_model,
         file_format=runtime_artifact_format,
     )
 
@@ -6791,6 +7345,10 @@ def run_experiment(experiment_config_path: Path, compact_summary: bool | None = 
     summary["artifact_paths"]["summary_csv"] = str(output_dir / "summary.csv")
     summary["artifact_paths"]["benchmark_markdown"] = str(output_dir / "benchmark_summary.md")
     summary["artifact_paths"]["artifact_manifest"] = str(output_dir / "artifact_manifest.json")
+    if stage2_feature_sharpening_report_path is not None:
+        summary["artifact_paths"]["stage2_feature_sharpening_report"] = str(stage2_feature_sharpening_report_path)
+    if stage2_advanced_feature_report_path is not None:
+        summary["artifact_paths"]["stage2_advanced_feature_report"] = str(stage2_advanced_feature_report_path)
     for model_name, paths in optuna_artifacts.items():
         model_token = _safe_filename_token(model_name)
         summary["artifact_paths"][f"optuna_trials_{model_token}"] = paths["trials_csv"]
@@ -6917,6 +7475,10 @@ def run_experiment(experiment_config_path: Path, compact_summary: bool | None = 
             "focus_class": str(threshold_tuning_cfg.get("focus_class", "Enrolled")),
         },
     }
+    if stage2_feature_sharpening_report_path is not None:
+        optional_updates["stage2_feature_sharpening_report"] = _status_from_path(stage2_feature_sharpening_report_path)
+    if stage2_advanced_feature_report_path is not None:
+        optional_updates["stage2_advanced_feature_report"] = _status_from_path(stage2_advanced_feature_report_path)
 
     update_artifact_manifest(
         output_dir=output_dir,

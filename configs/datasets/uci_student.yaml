@@ -1,22 +1,22 @@
-﻿# UCT / UCI Student dataset configuration.
+﻿# UCI / UCI Student dataset configuration.
 # Aligned to article_CSEDU_2026:
-# - UCT/UCI is treated as a 3-class problem: Dropout / Enrolled / Graduate
+# - CI is treated as a 3-class problem: Dropout / Enrolled / Graduate
 # - raw UCI file uses semicolon-separated columns and target column name "Target"
 # - this dataset has no natural student_id column, so entity_id is generated in adapter
 
 dataset:
-  name: uct_student
+  name: uci_student
   source_format: csv
 
 paths:
-  # UCT workflow should rebuild from raw CSV through loader -> adapter -> feature_builder.
-  raw_root: data/raw/uct_student
-  raw_file: data/raw/uct_student/uct_student.csv
-  interim_root: data/interim/uct_student
-  processed_root: data/processed/uct_student
+  # UCI workflow should rebuild from raw CSV through loader -> adapter -> feature_builder.
+  raw_root: data/raw/uci_student
+  raw_file: data/raw/uci_student/uci_student.csv
+  interim_root: data/interim/uci_student
+  processed_root: data/processed/uci_student_features.csv
 
 source:
-  filename: uct_student.csv
+  filename: uci_student.csv
   delimiter: ";"
   encoding: utf-8
 
@@ -26,7 +26,7 @@ schema:
   outcome_column: Target
 
 features:
-  builder: uct_student_features
+  builder: uci_student_features
   derive_safe_features: true
   include_groups:
     - demographics
@@ -36,7 +36,7 @@ features:
 
 outputs:
   # Export helper artifact only; experiments continue to read raw CSV via dataset config.
-  features_filename: uct_student_features.parquet
+  features_filename: uci_student_features.parquet
 
 preprocessing:
   # Optional dataset-specific leakage guards; merged with experiment-level forbidden columns.

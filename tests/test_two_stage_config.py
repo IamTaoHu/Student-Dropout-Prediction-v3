@@ -375,6 +375,28 @@ class TwoStageConfigTests(unittest.TestCase):
             "results/exp_uct_3class_two_stage_v5_enrolled_optuna_guarded",
         )
 
+    def test_v7_interaction_prototype_config_exists_and_matches_expected_contract_shape(self) -> None:
+        try:
+            import yaml
+        except Exception:
+            self.skipTest("PyYAML is not installed in this environment.")
+
+        path = Path("configs/experiments/exp_uct_3class_two_stage_v7_enrolled_interaction_prototype.yaml")
+        self.assertTrue(path.exists(), msg=f"Missing required config: {path}")
+        payload = yaml.safe_load(path.read_text(encoding="utf-8"))
+
+        self.assertEqual(payload["experiment"]["id"], "exp_uct_3class_two_stage_v7_enrolled_interaction_prototype")
+        self.assertEqual(payload["experiment"]["mode"], "two_stage")
+        self.assertEqual(payload["pipeline"]["task_type"], "two_stage_multiclass")
+        self.assertTrue(bool(payload["two_stage"]["stage2"]["feature_sharpening"]["enabled"]))
+        self.assertTrue(bool(payload["two_stage"]["stage2"]["advanced_enrolled_separation"]["enabled"]))
+        self.assertTrue(bool(payload["two_stage"]["stage2"]["advanced_enrolled_separation"]["interaction_features"]["enabled"]))
+        self.assertTrue(bool(payload["two_stage"]["stage2"]["advanced_enrolled_separation"]["prototype_distance"]["enabled"]))
+        self.assertEqual(
+            payload["outputs"]["results_dir"],
+            "results/exp_uct_3class_two_stage_v7_enrolled_interaction_prototype",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
