@@ -6,12 +6,14 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
+from sklearn.preprocessing import StandardScaler
 
 from src.data.feature_builders.uct_stage2_feature_sharpening import (
     _flag,
     _numeric,
     _resolve_semester_sources,
     _safe_divide,
+    safe_divide,
 )
 
 
@@ -29,6 +31,32 @@ DEFAULT_PROTOTYPE_METRIC_SET = [
     "margin",
     "inverse_similarity",
 ]
+
+DEFAULT_SELECTIVE_INTERACTION_ALLOWLIST = [
+    "sem1_approval_rate",
+    "sem2_approval_rate",
+    "sem1_grade_efficiency",
+    "sem2_grade_efficiency",
+    "approval_rate_delta",
+    "grade_delta",
+    "persistence_gap",
+    "load_pressure_sem1",
+    "load_pressure_sem2",
+    "completion_balance",
+]
+
+SELECTIVE_INTERACTION_REQUIREMENTS: dict[str, list[str]] = {
+    "sem1_approval_rate": ["approved_1st_sem", "enrolled_1st_sem"],
+    "sem2_approval_rate": ["approved_2nd_sem", "enrolled_2nd_sem"],
+    "sem1_grade_efficiency": ["grade_1st_sem", "approved_1st_sem", "enrolled_1st_sem"],
+    "sem2_grade_efficiency": ["grade_2nd_sem", "approved_2nd_sem", "enrolled_2nd_sem"],
+    "approval_rate_delta": ["approved_1st_sem", "approved_2nd_sem", "enrolled_1st_sem", "enrolled_2nd_sem"],
+    "grade_delta": ["grade_1st_sem", "grade_2nd_sem"],
+    "persistence_gap": ["approved_1st_sem", "approved_2nd_sem", "enrolled_1st_sem", "enrolled_2nd_sem"],
+    "load_pressure_sem1": ["approved_1st_sem", "enrolled_1st_sem"],
+    "load_pressure_sem2": ["approved_2nd_sem", "enrolled_2nd_sem"],
+    "completion_balance": ["approved_1st_sem", "approved_2nd_sem", "enrolled_1st_sem", "enrolled_2nd_sem"],
+}
 
 INTERACTION_FEATURE_REQUIREMENTS: dict[str, dict[str, list[str]]] = {
     "multiplicative": {
@@ -197,6 +225,21 @@ def _resolve_interaction_config(feature_cfg: dict[str, Any] | None) -> tuple[boo
     )
 
 
+def _resolve_selective_interaction_config(feature_cfg: dict[str, Any] | None) -> tuple[bool, list[str]]:
+    raw_cfg = feature_cfg if isinstance(feature_cfg, dict) else {}
+    enabled = bool(raw_cfg.get("enabled", False))
+    if not enabled:
+        return False, []
+    allowlist: list[str] = []
+    raw_allowlist = raw_cfg.get("feature_allowlist", [])
+    if isinstance(raw_allowlist, list):
+        for item in raw_allowlist:
+            feature_name = str(item).strip().lower()
+            if feature_name and feature_name in SELECTIVE_INTERACTION_REQUIREMENTS and feature_name not in allowlist:
+                allowlist.append(feature_name)
+    return True, allowlist or list(DEFAULT_SELECTIVE_INTERACTION_ALLOWLIST)
+
+
 def _resolve_metric_set(feature_cfg: dict[str, Any] | None) -> tuple[bool, list[str]]:
     raw_cfg = feature_cfg if isinstance(feature_cfg, dict) else {}
     enabled = bool(raw_cfg.get("enabled", False))
@@ -215,6 +258,27 @@ def _resolve_metric_set(feature_cfg: dict[str, Any] | None) -> tuple[bool, list[
         if metric in {"l1", "l2", "margin", "inverse_similarity", "normalized"} and metric not in normalized:
             normalized.append(metric)
     return True, normalized or list(DEFAULT_PROTOTYPE_METRIC_SET)
+
+
+def _resolve_robust_prototype_config(feature_cfg: dict[str, Any] | None) -> dict[str, Any]:
+    raw_cfg = feature_cfg if isinstance(feature_cfg, dict) else {}
+    enabled = bool(raw_cfg.get("enabled", False))
+    return {
+        "enabled": enabled,
+        "add_distance_features": bool(raw_cfg.get("add_distance_features", True)),
+        "add_ratio_features": bool(raw_cfg.get("add_ratio_features", True)),
+        "add_margin_feature": bool(raw_cfg.get("add_margin_feature", True)),
+        "add_cosine_similarity": bool(raw_cfg.get("add_cosine_similarity", False)),
+        "eps": float(raw_cfg.get("eps", 1.0e-8)),
+        "on_failure": str(raw_cfg.get("on_failure", "disable_and_continue")).strip().lower(),
+    }
+
+
+def _sanitize_feature_frame(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df.copy()
+    out = df.apply(pd.to_numeric, errors="coerce")
+    return out.replace([np.inf, -np.inf], np.nan)
 
 
 def _build_stage2_signal_frame(df: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, str]]:
@@ -279,6 +343,127 @@ def _build_stage2_signal_frame(df: pd.DataFrame) -> tuple[pd.DataFrame, dict[str
 
     signal = signal.replace([np.inf, -np.inf], np.nan)
     return signal, sources
+
+
+def _build_selective_interactions_for_df(
+    df: pd.DataFrame,
+    *,
+    allowlist: list[str],
+    target_column: str,
+) -> tuple[pd.DataFrame, list[str], list[str], list[str], dict[str, str]]:
+    signal, sources = _build_stage2_signal_frame(df)
+    output = pd.DataFrame(index=df.index)
+    if target_column in df.columns:
+        output[target_column] = df[target_column].copy()
+
+    created_features: list[str] = []
+    skipped_features: list[str] = []
+    skipped_existing_features: list[str] = []
+
+    def missing_sources(feature_name: str) -> bool:
+        required = SELECTIVE_INTERACTION_REQUIREMENTS.get(feature_name, [])
+        ready = all(token in sources for token in required)
+        if not ready:
+            skipped_features.append(feature_name)
+        return not ready
+
+    def add(feature_name: str, values: pd.Series) -> None:
+        output[feature_name] = pd.to_numeric(values, errors="coerce").replace([np.inf, -np.inf], np.nan).astype(float)
+        created_features.append(feature_name)
+
+    sem1_approval_rate = signal.get("approved_ratio_1st")
+    sem2_approval_rate = signal.get("approved_ratio_2nd")
+    grade_1 = signal.get("grade_1st_sem")
+    grade_2 = signal.get("grade_2nd_sem")
+    approved_1 = signal.get("approved_1st_sem")
+    approved_2 = signal.get("approved_2nd_sem")
+    enrolled_1 = signal.get("enrolled_1st_sem")
+    enrolled_2 = signal.get("enrolled_2nd_sem")
+    approved_total = signal.get("approved_total")
+    enrolled_total = signal.get("enrolled_total")
+
+    for feature_name in allowlist:
+        if feature_name in output.columns or feature_name in df.columns:
+            skipped_existing_features.append(feature_name)
+            continue
+        if feature_name not in SELECTIVE_INTERACTION_REQUIREMENTS:
+            skipped_features.append(feature_name)
+            continue
+        if missing_sources(feature_name):
+            continue
+        if feature_name == "sem1_approval_rate":
+            add(feature_name, safe_divide(approved_1, enrolled_1, default=0.0))
+        elif feature_name == "sem2_approval_rate":
+            add(feature_name, safe_divide(approved_2, enrolled_2, default=0.0))
+        elif feature_name == "sem1_grade_efficiency":
+            add(feature_name, grade_1 * safe_divide(approved_1, enrolled_1, default=0.0))
+        elif feature_name == "sem2_grade_efficiency":
+            add(feature_name, grade_2 * safe_divide(approved_2, enrolled_2, default=0.0))
+        elif feature_name == "approval_rate_delta":
+            add(feature_name, sem2_approval_rate.fillna(0.0) - sem1_approval_rate.fillna(0.0))
+        elif feature_name == "grade_delta":
+            add(feature_name, grade_2 - grade_1)
+        elif feature_name == "persistence_gap":
+            add(feature_name, (sem2_approval_rate.fillna(0.0) - sem1_approval_rate.fillna(0.0)).abs())
+        elif feature_name == "load_pressure_sem1":
+            add(feature_name, enrolled_1 - approved_1)
+        elif feature_name == "load_pressure_sem2":
+            add(feature_name, enrolled_2 - approved_2)
+        elif feature_name == "completion_balance":
+            add(feature_name, safe_divide(approved_total, enrolled_total, default=0.0))
+
+    feature_cols = [col for col in output.columns if col != target_column]
+    if feature_cols:
+        output[feature_cols] = output[feature_cols].replace([np.inf, -np.inf], np.nan)
+    return output, created_features, skipped_features, skipped_existing_features, sources
+
+
+def build_stage2_selective_interaction_split_data(
+    split_data: dict[str, pd.DataFrame],
+    *,
+    target_column: str = "target",
+    feature_cfg: dict[str, Any] | None = None,
+) -> tuple[dict[str, pd.DataFrame], dict[str, Any]]:
+    enabled, allowlist = _resolve_selective_interaction_config(feature_cfg)
+    report: dict[str, Any] = {
+        "enabled": enabled,
+        "feature_allowlist": allowlist,
+        "default_feature_allowlist": list(DEFAULT_SELECTIVE_INTERACTION_ALLOWLIST),
+        "created_features": [],
+        "created_feature_count": 0,
+        "skipped_features": [],
+        "skipped_existing_features": [],
+        "source_columns": {},
+    }
+    if not enabled:
+        empty_splits = {
+            split_name: pd.DataFrame({target_column: df[target_column].copy()}) if target_column in df.columns else pd.DataFrame(index=df.index)
+            for split_name, df in split_data.items()
+        }
+        return empty_splits, report
+
+    transformed: dict[str, pd.DataFrame] = {}
+    created_features: list[str] = []
+    skipped_features: list[str] = []
+    skipped_existing_features: list[str] = []
+    for split_name, df in split_data.items():
+        feature_df, split_created, split_skipped, split_existing, sources = _build_selective_interactions_for_df(
+            df,
+            allowlist=allowlist,
+            target_column=target_column,
+        )
+        transformed[split_name] = feature_df
+        if split_name == "train":
+            created_features = list(split_created)
+            skipped_features = list(split_skipped)
+            skipped_existing_features = list(split_existing)
+            report["source_columns"] = dict(sources)
+
+    report["created_features"] = created_features
+    report["created_feature_count"] = int(len(created_features))
+    report["skipped_features"] = skipped_features
+    report["skipped_existing_features"] = skipped_existing_features
+    return transformed, report
 
 
 def _build_interaction_features_for_df(
@@ -411,7 +596,7 @@ def build_stage2_interaction_split_data(
     return transformed, report
 
 
-def build_stage2_prototype_distance_features(
+def _build_legacy_stage2_prototype_distance_features(
     *,
     X_train: pd.DataFrame,
     y_train: pd.Series,
@@ -526,3 +711,137 @@ def build_stage2_prototype_distance_features(
     report["prototype_feature_columns"] = list(transformed["train"].columns)
     report["created_feature_count"] = int(len(report["prototype_feature_columns"]))
     return transformed, report
+
+
+def _build_robust_stage2_prototype_distance_features(
+    *,
+    X_train: pd.DataFrame,
+    y_train: pd.Series,
+    X_valid: pd.DataFrame,
+    X_test: pd.DataFrame,
+    feature_cfg: dict[str, Any] | None = None,
+    enrolled_positive_label: int = 1,
+) -> tuple[dict[str, pd.DataFrame], dict[str, Any]]:
+    cfg = _resolve_robust_prototype_config(feature_cfg)
+    report: dict[str, Any] = {
+        "enabled": bool(cfg.get("enabled", False)),
+        "metric_set": ["robust_distance"],
+        "prototype_source_columns": [],
+        "prototype_feature_columns": [],
+        "prototype_definition": "classwise_mean_standardized",
+        "fitted_on_train_only": True,
+        "standardized_feature_space": True,
+        "failure_mode": cfg.get("on_failure", "disable_and_continue"),
+    }
+    empty = {
+        "train": pd.DataFrame(index=X_train.index),
+        "valid": pd.DataFrame(index=X_valid.index),
+        "test": pd.DataFrame(index=X_test.index),
+    }
+    if not bool(cfg.get("enabled", False)):
+        return empty, report
+
+    try:
+        source_columns = [
+            col
+            for col in X_train.columns
+            if col in X_valid.columns and col in X_test.columns and pd.api.types.is_numeric_dtype(X_train[col])
+        ]
+        if not source_columns:
+            report["skip_reason"] = "no_shared_numeric_source_columns"
+            return empty, report
+
+        y_arr = pd.Series(y_train).reset_index(drop=True).astype(int)
+        positive_label = int(enrolled_positive_label)
+        enrolled_mask = y_arr == positive_label
+        graduate_mask = y_arr != positive_label
+        if int(enrolled_mask.sum()) == 0 or int(graduate_mask.sum()) == 0:
+            report["skip_reason"] = "missing_stage2_class_for_prototypes"
+            report["prototype_source_columns"] = list(source_columns)
+            return empty, report
+
+        train_numeric = _sanitize_feature_frame(X_train.loc[:, source_columns]).reset_index(drop=True)
+        valid_numeric = _sanitize_feature_frame(X_valid.loc[:, source_columns]).reset_index(drop=True)
+        test_numeric = _sanitize_feature_frame(X_test.loc[:, source_columns]).reset_index(drop=True)
+        fill_values = train_numeric.median(axis=0, numeric_only=True).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+        train_filled = train_numeric.fillna(fill_values)
+        valid_filled = valid_numeric.fillna(fill_values)
+        test_filled = test_numeric.fillna(fill_values)
+
+        scaler = StandardScaler()
+        train_scaled = pd.DataFrame(scaler.fit_transform(train_filled), columns=source_columns, index=X_train.index)
+        valid_scaled = pd.DataFrame(scaler.transform(valid_filled), columns=source_columns, index=X_valid.index)
+        test_scaled = pd.DataFrame(scaler.transform(test_filled), columns=source_columns, index=X_test.index)
+
+        enrolled_proto = train_scaled.reset_index(drop=True).loc[enrolled_mask].mean(axis=0)
+        graduate_proto = train_scaled.reset_index(drop=True).loc[graduate_mask].mean(axis=0)
+        eps = max(float(cfg.get("eps", 1.0e-8)), 1.0e-12)
+
+        def transform_frame(df_scaled: pd.DataFrame) -> pd.DataFrame:
+            enrolled_delta = df_scaled.subtract(enrolled_proto, axis=1)
+            graduate_delta = df_scaled.subtract(graduate_proto, axis=1)
+            dist_enrolled = np.sqrt((enrolled_delta ** 2).sum(axis=1)).astype(float)
+            dist_graduate = np.sqrt((graduate_delta ** 2).sum(axis=1)).astype(float)
+            out = pd.DataFrame(index=df_scaled.index)
+            if bool(cfg.get("add_distance_features", True)):
+                out["dist_to_enrolled_proto"] = dist_enrolled
+                out["dist_to_graduate_proto"] = dist_graduate
+            if bool(cfg.get("add_margin_feature", True)):
+                out["proto_margin"] = (dist_graduate - dist_enrolled).astype(float)
+            if bool(cfg.get("add_ratio_features", True)):
+                out["proto_ratio"] = safe_divide(dist_enrolled, dist_graduate, default=1.0, eps=eps).clip(lower=0.0, upper=1.0e6)
+            if bool(cfg.get("add_cosine_similarity", False)):
+                enrolled_norm = max(float(np.linalg.norm(enrolled_proto.to_numpy(dtype=float))), eps)
+                graduate_norm = max(float(np.linalg.norm(graduate_proto.to_numpy(dtype=float))), eps)
+                sample_norm = np.maximum(np.linalg.norm(df_scaled.to_numpy(dtype=float), axis=1), eps)
+                enrolled_cos = np.clip(df_scaled.to_numpy(dtype=float) @ enrolled_proto.to_numpy(dtype=float) / (sample_norm * enrolled_norm), -1.0, 1.0)
+                graduate_cos = np.clip(df_scaled.to_numpy(dtype=float) @ graduate_proto.to_numpy(dtype=float) / (sample_norm * graduate_norm), -1.0, 1.0)
+                out["cosine_to_enrolled_proto"] = enrolled_cos.astype(float)
+                out["cosine_to_graduate_proto"] = graduate_cos.astype(float)
+            return _sanitize_feature_frame(out).fillna(0.0)
+
+        transformed = {
+            "train": transform_frame(train_scaled),
+            "valid": transform_frame(valid_scaled),
+            "test": transform_frame(test_scaled),
+        }
+        report["prototype_source_columns"] = list(source_columns)
+        report["prototype_feature_columns"] = list(transformed["train"].columns)
+        report["created_feature_count"] = int(len(report["prototype_feature_columns"]))
+        return transformed, report
+    except Exception as exc:
+        report["warning"] = f"prototype_augmentation_failed:{type(exc).__name__}: {exc}"
+        if str(cfg.get("on_failure", "disable_and_continue")).strip().lower() == "disable_and_continue":
+            report["enabled"] = False
+            report["disabled_due_to_failure"] = True
+            return empty, report
+        raise
+
+
+def build_stage2_prototype_distance_features(
+    *,
+    X_train: pd.DataFrame,
+    y_train: pd.Series,
+    X_valid: pd.DataFrame,
+    X_test: pd.DataFrame,
+    feature_cfg: dict[str, Any] | None = None,
+    enrolled_positive_label: int = 1,
+) -> tuple[dict[str, pd.DataFrame], dict[str, Any]]:
+    robust_cfg = _resolve_robust_prototype_config(feature_cfg)
+    if bool(robust_cfg.get("enabled", False)):
+        return _build_robust_stage2_prototype_distance_features(
+            X_train=X_train,
+            y_train=y_train,
+            X_valid=X_valid,
+            X_test=X_test,
+            feature_cfg=feature_cfg,
+            enrolled_positive_label=enrolled_positive_label,
+        )
+    return _build_legacy_stage2_prototype_distance_features(
+        X_train=X_train,
+        y_train=y_train,
+        X_valid=X_valid,
+        X_test=X_test,
+        feature_cfg=feature_cfg,
+        enrolled_positive_label=enrolled_positive_label,
+    )

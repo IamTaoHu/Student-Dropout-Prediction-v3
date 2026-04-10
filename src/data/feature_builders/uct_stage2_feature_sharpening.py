@@ -163,13 +163,32 @@ def _numeric(df: pd.DataFrame, column_name: str) -> pd.Series:
     return pd.to_numeric(df[column_name], errors="coerce").astype(float)
 
 
-def _safe_divide(numerator: pd.Series, denominator: pd.Series) -> pd.Series:
-    num = pd.to_numeric(numerator, errors="coerce").astype(float)
-    den = pd.to_numeric(denominator, errors="coerce").astype(float)
-    out = pd.Series(np.nan, index=num.index, dtype=float)
-    valid = den.abs() > 1.0e-12
+def safe_divide(
+    numerator: pd.Series | np.ndarray | float,
+    denominator: pd.Series | np.ndarray | float,
+    default: float = 0.0,
+    eps: float = 1.0e-8,
+) -> pd.Series:
+    if isinstance(numerator, pd.Series):
+        num = pd.to_numeric(numerator, errors="coerce").astype(float)
+    else:
+        num = pd.Series(np.asarray(numerator, dtype=float))
+    if isinstance(denominator, pd.Series):
+        den = pd.to_numeric(denominator, errors="coerce").astype(float)
+    else:
+        den_arr = np.asarray(denominator, dtype=float)
+        if den_arr.ndim == 0:
+            den = pd.Series(float(den_arr), index=num.index, dtype=float)
+        else:
+            den = pd.Series(den_arr, index=num.index, dtype=float)
+    out = pd.Series(default, index=num.index, dtype=float)
+    valid = den.abs() > float(eps)
     out.loc[valid] = num.loc[valid] / den.loc[valid]
-    return out.replace([np.inf, -np.inf], np.nan)
+    return out.replace([np.inf, -np.inf], np.nan).fillna(float(default))
+
+
+def _safe_divide(numerator: pd.Series, denominator: pd.Series) -> pd.Series:
+    return safe_divide(numerator, denominator, default=np.nan, eps=1.0e-12)
 
 
 def _flag(mask: pd.Series) -> pd.Series:

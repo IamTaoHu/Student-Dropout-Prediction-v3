@@ -10,6 +10,37 @@ import pandas as pd
 
 
 @dataclass
+class Stage2PositiveProbabilityCalibrator:
+    """Post-hoc binary probability transform for Stage 2 positive-class probabilities."""
+
+    method: str = "none"
+    payload: dict[str, Any] | None = None
+
+    def transform(self, probabilities: np.ndarray | list[float]) -> np.ndarray:
+        p = np.clip(np.asarray(probabilities, dtype=float), 1.0e-6, 1.0 - 1.0e-6)
+        payload = self.payload if isinstance(self.payload, dict) else {}
+        method = str(self.method).strip().lower()
+        if method in {"", "none"}:
+            return p
+        if method == "temperature_scaling":
+            temperature = max(float(payload.get("temperature", 1.0)), 1.0e-6)
+            logits = np.log(p / (1.0 - p))
+            return 1.0 / (1.0 + np.exp(-(logits / temperature)))
+        if method == "sigmoid":
+            coef = float(payload.get("coef", 1.0))
+            intercept = float(payload.get("intercept", 0.0))
+            logits = np.log(p / (1.0 - p))
+            return 1.0 / (1.0 + np.exp(-((coef * logits) + intercept)))
+        if method == "isotonic":
+            thresholds = np.asarray(payload.get("x_thresholds", []), dtype=float)
+            values = np.asarray(payload.get("y_thresholds", []), dtype=float)
+            if thresholds.size == 0 or values.size == 0 or thresholds.size != values.size:
+                return p
+            return np.interp(p, thresholds, values, left=values[0], right=values[-1])
+        return p
+
+
+@dataclass
 class TwoStageUct3ClassClassifier:
     """Wrap two binary models into a single 3-class predictor."""
 
@@ -29,6 +60,7 @@ class TwoStageUct3ClassClassifier:
     stage2_positive_target_label: int | None = None
     class_thresholds: dict[int, float] | None = None
     stage2_decision_config: dict[str, Any] | None = None
+    stage2_probability_calibrator: Any | None = None
     stage1_feature_columns: list[str] | None = None
     stage2_feature_columns: list[str] | None = None
 
@@ -101,8 +133,18 @@ class TwoStageUct3ClassClassifier:
         enabled = bool(raw_cfg.get("enabled", False)) and strategy == "enrolled_guarded_threshold"
         threshold = float(raw_cfg.get("enrolled_probability_threshold", 0.5))
         margin_guard = float(raw_cfg.get("graduate_margin_guard", 0.0))
+        enrolled_margin = raw_cfg.get("enrolled_margin")
+        if enrolled_margin is None:
+            enrolled_margin = -float(margin_guard)
+        enrolled_margin = float(enrolled_margin)
+        dropout_probability_guard = raw_cfg.get("dropout_probability_guard")
+        if dropout_probability_guard is None:
+            dropout_probability_guard = 1.0
+        dropout_probability_guard = float(dropout_probability_guard)
         threshold = min(max(threshold, 0.0), 1.0)
         margin_guard = min(max(margin_guard, 0.0), 1.0)
+        enrolled_margin = min(max(enrolled_margin, -1.0), 1.0)
+        dropout_probability_guard = min(max(dropout_probability_guard, 0.0), 1.0)
         normalized = dict(raw_cfg)
         normalized.update(
             {
@@ -110,6 +152,8 @@ class TwoStageUct3ClassClassifier:
                 "strategy": strategy if enabled else "argmax",
                 "enrolled_probability_threshold": threshold,
                 "graduate_margin_guard": margin_guard,
+                "enrolled_margin": enrolled_margin,
+                "dropout_probability_guard": dropout_probability_guard,
             }
         )
         return normalized
@@ -184,6 +228,12 @@ class TwoStageUct3ClassClassifier:
             positive_label=int(self.stage2_positive_label),
         )
         p_positive_given_non_dropout = np.clip(p_positive_given_non_dropout, 0.0, 1.0)
+        if self.stage2_probability_calibrator is not None:
+            p_positive_given_non_dropout = np.asarray(
+                self.stage2_probability_calibrator.transform(p_positive_given_non_dropout),
+                dtype=float,
+            )
+            p_positive_given_non_dropout = np.clip(p_positive_given_non_dropout, 0.0, 1.0)
         p_negative_given_non_dropout = np.clip(1.0 - p_positive_given_non_dropout, 0.0, 1.0)
         if int(self.stage2_positive_target_label) == int(self.enrolled_label):
             p_enrolled_given_non_dropout = p_positive_given_non_dropout
@@ -245,6 +295,7 @@ class TwoStageUct3ClassClassifier:
         *,
         p_enrolled_given_non_dropout: np.ndarray | None,
         p_graduate_given_non_dropout: np.ndarray | None,
+        p_dropout: np.ndarray | None = None,
         dropout_label: int,
         enrolled_label: int,
         graduate_label: int,
@@ -271,18 +322,48 @@ class TwoStageUct3ClassClassifier:
 
         threshold = float(cfg.get("enrolled_probability_threshold", 0.5))
         margin_guard = float(cfg.get("graduate_margin_guard", 0.0))
+        enrolled_margin = float(cfg.get("enrolled_margin", -margin_guard))
+        dropout_probability_guard = float(cfg.get("dropout_probability_guard", 1.0))
         non_dropout_mask = preds != int(dropout_label)
-        enrolled_mask = non_dropout_mask & (p_enrolled >= threshold) & ((p_graduate - p_enrolled) <= margin_guard)
+        dropout_guard_mask = np.ones(preds.shape[0], dtype=bool)
+        if p_dropout is not None:
+            p_dropout_arr = np.asarray(p_dropout, dtype=float)
+            if p_dropout_arr.shape == preds.shape:
+                dropout_guard_mask = p_dropout_arr <= dropout_probability_guard
+        enrolled_mask = (
+            non_dropout_mask
+            & (p_enrolled >= threshold)
+            & ((p_graduate - p_enrolled) <= margin_guard)
+            & ((p_enrolled - p_graduate) >= enrolled_margin)
+            & dropout_guard_mask
+        )
         graduate_mask = non_dropout_mask & (~enrolled_mask)
 
         preds[enrolled_mask] = int(enrolled_label)
         preds[graduate_mask] = int(graduate_label)
         reasons[preds == int(dropout_label)] = "dropout_preserved"
-        reasons[graduate_mask] = np.where(
-            p_enrolled[graduate_mask] < threshold,
-            "graduate_preserved_below_enrolled_threshold",
-            "graduate_preserved_by_margin_guard",
-        )
+        graduate_reason = np.full(int(np.sum(graduate_mask)), "graduate_preserved_by_margin_guard", dtype=object)
+        if np.any(graduate_mask):
+            graduate_reason = np.where(
+                p_enrolled[graduate_mask] < threshold,
+                "graduate_preserved_below_enrolled_threshold",
+                graduate_reason,
+            )
+            graduate_reason = np.where(
+                (p_enrolled[graduate_mask] >= threshold) & ((p_enrolled[graduate_mask] - p_graduate[graduate_mask]) < enrolled_margin),
+                "graduate_preserved_below_enrolled_margin",
+                graduate_reason,
+            )
+            if p_dropout is not None:
+                p_dropout_arr = np.asarray(p_dropout, dtype=float)
+                if p_dropout_arr.shape == preds.shape:
+                    graduate_reason = np.where(
+                        (p_enrolled[graduate_mask] >= threshold)
+                        & (p_dropout_arr[graduate_mask] > dropout_probability_guard),
+                        "graduate_preserved_by_dropout_guard",
+                        graduate_reason,
+                    )
+        reasons[graduate_mask] = graduate_reason
         reasons[enrolled_mask] = np.where(
             p_graduate[enrolled_mask] > p_enrolled[enrolled_mask],
             "enrolled_selected_within_margin_guard",

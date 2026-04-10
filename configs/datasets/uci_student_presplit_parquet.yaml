@@ -1,0 +1,59 @@
+# UCI Student predefined parquet split configuration for v9 decision-centric runs only.
+# This keeps the default CSV-based UCI dataset config unchanged for older experiments.
+
+dataset:
+  name: uci_student
+  source_format: parquet
+
+paths:
+  raw_root: data/raw/uci_student
+  raw_file: data/raw/uci_student/uci_student.csv
+  interim_root: data/interim/uci_student
+  processed_root: data/processed/uci_student_features.csv
+
+source:
+  filename: uci_student.csv
+  delimiter: ";"
+  encoding: utf-8
+
+data_source:
+  format: parquet
+  split_mode: predefined
+  train_path: data/processed/uci/uci_12_03_train.parquet
+  test_path: data/processed/uci/uci_12_03_test.parquet
+
+schema:
+  entity_id: null
+  term_column: null
+  outcome_column: Target
+
+features:
+  builder: uci_student_features
+  derive_safe_features: true
+  include_groups:
+    - demographics
+    - enrollment
+    - academic_performance
+    - engagement
+
+outputs:
+  features_filename: uci_student_features.parquet
+
+preprocessing:
+  forbidden_feature_columns: []
+
+target_mappings:
+  binary:
+    Dropout: 1
+    Enrolled: 0
+    Graduate: 0
+
+  three_class:
+    Dropout: 2
+    Enrolled: 1
+    Graduate: 0
+
+  four_class:
+    Dropout: 2
+    Enrolled: 1
+    Graduate: 0

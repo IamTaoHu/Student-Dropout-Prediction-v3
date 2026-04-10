@@ -15,7 +15,7 @@ from scripts.run_experiment import (
     _resolve_two_stage_stage1_dropout_threshold_config,
     _resolve_two_stage_stage_class_weights,
 )
-from src.models.two_stage_uct import TwoStageUct3ClassClassifier
+from src.models.two_stage_uct import Stage2PositiveProbabilityCalibrator, TwoStageUct3ClassClassifier
 
 
 class _DummyBinaryModel:
@@ -243,6 +243,58 @@ class TwoStageConfigTests(unittest.TestCase):
         self.assertAlmostEqual(float(resolved["objective"]["enrolled_f1_alpha"]), 0.4)
         self.assertAlmostEqual(float(resolved["objective"]["graduate_f1_penalty_beta"]), 1.7)
 
+    def test_stage2_decision_policy_config_resolver_supports_inner_split_and_calibration(self) -> None:
+        resolved = _resolve_two_stage_stage2_decision_config(
+            {
+                "stage2": {
+                    "decision_policy": {
+                        "enabled": True,
+                        "mode": "enrolled_aware_multi_objective",
+                        "strategy": "enrolled_guarded_threshold",
+                        "use_calibrated_proba": True,
+                        "calibration_method": "temperature_scaling",
+                        "enrolled_probability_threshold": 0.44,
+                        "enrolled_margin": 0.03,
+                        "search": {
+                            "method": "grid",
+                            "enrolled_probability_threshold": {"min": 0.40, "max": 0.44, "step": 0.02},
+                            "enrolled_margin": {"min": 0.00, "max": 0.04, "step": 0.02},
+                        },
+                        "objective": {
+                            "metric": "custom",
+                            "alpha_enrolled_f1": 0.35,
+                            "beta_graduate_drop_penalty": 0.25,
+                            "gamma_macro_f1": 1.0,
+                            "graduate_f1_tolerance_vs_baseline": 0.02,
+                        },
+                        "anti_overfit": {
+                            "strategy": "stage2_train_inner_split",
+                            "tuning_size": 0.25,
+                            "min_tuning_samples": 16,
+                        },
+                    }
+                }
+            }
+        )
+
+        self.assertEqual(resolved["config_schema"], "decision_policy")
+        self.assertTrue(bool(resolved["use_calibrated_proba"]))
+        self.assertEqual(resolved["calibration_method"], "temperature_scaling")
+        self.assertEqual(resolved["mode"], "enrolled_aware_multi_objective")
+        self.assertListEqual(resolved["search"]["enrolled_margin_grid"], [0.0, 0.02, 0.04])
+        self.assertEqual(resolved["anti_overfit"]["strategy"], "stage2_train_inner_split")
+
+    def test_stage2_probability_calibrator_temperature_scaling_preserves_bounds(self) -> None:
+        calibrator = Stage2PositiveProbabilityCalibrator(
+            method="temperature_scaling",
+            payload={"temperature": 2.0},
+        )
+        transformed = calibrator.transform(np.array([0.1, 0.5, 0.9], dtype=float))
+
+        self.assertTrue(np.all(transformed > 0.0))
+        self.assertTrue(np.all(transformed < 1.0))
+        self.assertAlmostEqual(float(transformed[1]), 0.5, places=6)
+
     def test_new_soft_fusion_config_exists_and_matches_expected_contract_shape(self) -> None:
         try:
             import yaml
@@ -395,6 +447,27 @@ class TwoStageConfigTests(unittest.TestCase):
         self.assertEqual(
             payload["outputs"]["results_dir"],
             "results/exp_uct_3class_two_stage_v7_enrolled_interaction_prototype",
+        )
+
+    def test_v9_uci_decision_centric_config_exists_and_matches_expected_contract_shape(self) -> None:
+        try:
+            import yaml
+        except Exception:
+            self.skipTest("PyYAML is not installed in this environment.")
+
+        path = Path("configs/experiments/exp_uci_3class_two_stage_v9_decision_centric.yaml")
+        self.assertTrue(path.exists(), msg=f"Missing required config: {path}")
+        payload = yaml.safe_load(path.read_text(encoding="utf-8"))
+
+        self.assertEqual(payload["experiment"]["id"], "exp_uci_3class_two_stage_v9_decision_centric")
+        self.assertEqual(payload["experiment"]["dataset_config"], "configs/datasets/uci_student_presplit_parquet.yaml")
+        self.assertListEqual(payload["models"]["candidates"], ["gradient_boosting", "xgboost", "lightgbm", "catboost"])
+        self.assertFalse(bool(payload["two_stage"]["stage2"]["feature_sharpening"]["enabled"]))
+        self.assertFalse(bool(payload["two_stage"]["stage2"]["robust_prototypes"]["enabled"]))
+        self.assertTrue(bool(payload["two_stage"]["stage2"]["decision_policy"]["enabled"]))
+        self.assertEqual(
+            payload["outputs"]["results_dir"],
+            "results/exp_uci_3class_two_stage_v9_decision_centric",
         )
 
 
