@@ -2,7 +2,7 @@
 # This keeps the default CSV-based UCI dataset config unchanged for older experiments.
 
 dataset:
-  name: uci_student
+  name: uci_student_presplit_parquet
   source_format: parquet
 
 paths:

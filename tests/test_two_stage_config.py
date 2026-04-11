@@ -13,6 +13,7 @@ from scripts.run_experiment import (
     _resolve_two_stage_stage2_decision_config,
     _resolve_two_stage_stage2_positive_target_label,
     _resolve_two_stage_stage1_dropout_threshold_config,
+    _stage2_decision_policy_acceptance,
     _resolve_two_stage_stage_class_weights,
 )
 from src.models.two_stage_uct import Stage2PositiveProbabilityCalibrator, TwoStageUct3ClassClassifier
@@ -284,6 +285,66 @@ class TwoStageConfigTests(unittest.TestCase):
         self.assertListEqual(resolved["search"]["enrolled_margin_grid"], [0.0, 0.02, 0.04])
         self.assertEqual(resolved["anti_overfit"]["strategy"], "stage2_train_inner_split")
 
+    def test_stage2_decision_policy_config_resolver_supports_enrolled_priority_mode(self) -> None:
+        resolved = _resolve_two_stage_stage2_decision_config(
+            {
+                "stage2": {
+                    "decision_policy": {
+                        "enabled": True,
+                        "mode": "enrolled_priority",
+                        "strategy": "enrolled_guarded_threshold",
+                        "objective": {
+                            "name": "enrolled_priority",
+                            "mode": "enrolled_priority",
+                        },
+                        "acceptance": {
+                            "metric": "enrolled_priority_guarded",
+                            "min_enrolled_f1_gain": 0.005,
+                            "max_final_macro_f1_drop": 0.003,
+                        },
+                    }
+                }
+            }
+        )
+
+        self.assertEqual(resolved["objective"]["mode"], "enrolled_priority")
+        self.assertEqual(resolved["acceptance"]["metric"], "enrolled_priority_guarded")
+        self.assertAlmostEqual(float(resolved["acceptance"]["max_final_macro_f1_drop"]), 0.003)
+
+    def test_enrolled_priority_acceptance_requires_enrolled_gain_with_guards(self) -> None:
+        accepted = _stage2_decision_policy_acceptance(
+            baseline_metrics={"macro_f1": 0.70},
+            baseline_per_class={"1": {"f1": 0.50}, "2": {"f1": 0.80}},
+            tuned_metrics={"macro_f1": 0.698},
+            tuned_per_class={"1": {"f1": 0.508}, "2": {"f1": 0.785}},
+            enrolled_idx=1,
+            graduate_idx=2,
+            acceptance_cfg={
+                "metric": "enrolled_priority_guarded",
+                "min_enrolled_f1_gain": 0.005,
+                "max_final_macro_f1_drop": 0.003,
+                "graduate_f1_tolerance_vs_baseline": 0.02,
+            },
+        )
+        rejected = _stage2_decision_policy_acceptance(
+            baseline_metrics={"macro_f1": 0.70},
+            baseline_per_class={"1": {"f1": 0.50}, "2": {"f1": 0.80}},
+            tuned_metrics={"macro_f1": 0.695},
+            tuned_per_class={"1": {"f1": 0.508}, "2": {"f1": 0.785}},
+            enrolled_idx=1,
+            graduate_idx=2,
+            acceptance_cfg={
+                "metric": "enrolled_priority_guarded",
+                "min_enrolled_f1_gain": 0.005,
+                "max_final_macro_f1_drop": 0.003,
+                "graduate_f1_tolerance_vs_baseline": 0.02,
+            },
+        )
+
+        self.assertTrue(bool(accepted["accepted"]))
+        self.assertFalse(bool(rejected["accepted"]))
+        self.assertEqual(rejected["reason"], "rejected_final_macro_guard")
+
     def test_stage2_probability_calibrator_temperature_scaling_preserves_bounds(self) -> None:
         calibrator = Stage2PositiveProbabilityCalibrator(
             method="temperature_scaling",
@@ -468,6 +529,27 @@ class TwoStageConfigTests(unittest.TestCase):
         self.assertEqual(
             payload["outputs"]["results_dir"],
             "results/exp_uci_3class_two_stage_v9_decision_centric",
+        )
+
+    def test_v9_3_uci_enrolled_priority_config_exists_and_matches_expected_contract_shape(self) -> None:
+        try:
+            import yaml
+        except Exception:
+            self.skipTest("PyYAML is not installed in this environment.")
+
+        path = Path("configs/experiments/exp_uci_3class_two_stage_v9_3_enrolled_priority.yaml")
+        self.assertTrue(path.exists(), msg=f"Missing required config: {path}")
+        payload = yaml.safe_load(path.read_text(encoding="utf-8"))
+
+        self.assertEqual(payload["experiment"]["id"], "exp_uci_3class_two_stage_v9_3_enrolled_priority")
+        self.assertEqual(payload["experiment"]["dataset_config"], "configs/datasets/uci_student_presplit_parquet.yaml")
+        self.assertListEqual(payload["models"]["candidates"], ["gradient_boosting", "xgboost", "lightgbm", "catboost"])
+        self.assertEqual(payload["two_stage"]["stage2"]["decision_policy"]["mode"], "enrolled_priority")
+        self.assertEqual(payload["two_stage"]["stage2"]["decision_policy"]["objective"]["mode"], "enrolled_priority")
+        self.assertEqual(payload["two_stage"]["stage2"]["decision_policy"]["acceptance"]["metric"], "enrolled_priority_guarded")
+        self.assertEqual(
+            payload["outputs"]["results_dir"],
+            "results/exp_uci_3class_two_stage_v9_3_enrolled_priority",
         )
 
 

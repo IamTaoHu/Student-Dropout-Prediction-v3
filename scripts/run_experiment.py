@@ -79,6 +79,7 @@ DATASET_NAME_ALIASES = {
     "uct": "uct_student",
     "uci": "uct_student",
     "uci_student": "uct_student",
+    "uci_student_presplit_parquet": "uct_student",
     "uci-student": "uct_student",
     "uct_student": "uct_student",
     "uct-student": "uct_student",
@@ -3912,6 +3913,9 @@ def _resolve_two_stage_stage2_decision_config(two_stage_cfg: dict[str, Any]) -> 
         },
         "objective": {
             "name": str(objective_cfg.get("name", "macro_f1_plus_enrolled_gain_with_graduate_guard")).strip().lower(),
+            "mode": str(
+                objective_cfg.get("mode", objective_cfg.get("objective_mode", objective_cfg.get("name", "legacy_macro_priority")))
+            ).strip().lower(),
             "enrolled_f1_alpha": float(objective_cfg.get("enrolled_f1_alpha", 0.35)),
             "graduate_f1_penalty_beta": float(objective_cfg.get("graduate_f1_penalty_beta", 1.5)),
             "metric": str(objective_cfg.get("metric", "custom")).strip().lower(),
@@ -3933,6 +3937,7 @@ def _resolve_two_stage_stage2_decision_config(two_stage_cfg: dict[str, Any]) -> 
                     objective_cfg.get("graduate_f1_tolerance_vs_baseline", 0.02),
                 )
             ),
+            "max_final_macro_f1_drop": float(acceptance_cfg.get("max_final_macro_f1_drop", 0.002)),
         },
         "anti_overfit": {
             "strategy": str(overfit_cfg.get("strategy", "stage2_train_inner_split")).strip().lower(),
@@ -4447,6 +4452,7 @@ def _compute_stage2_decision_objective_components(
     graduate_idx: int,
     objective_cfg: dict[str, Any],
     baseline_graduate_f1: float,
+    branch_macro_f1: float | None = None,
 ) -> dict[str, float]:
     macro_f1 = float(metrics.get("macro_f1", 0.0))
     enrolled_f1 = float(per_class.get(str(enrolled_idx), {}).get("f1", 0.0))
@@ -4458,13 +4464,29 @@ def _compute_stage2_decision_objective_components(
     )
     tolerance = float(objective_cfg.get("graduate_f1_tolerance_vs_baseline", 0.02))
     enrolled_floor = float(objective_cfg.get("enrolled_f1_floor", 0.0))
+    objective_mode = str(
+        objective_cfg.get("mode", objective_cfg.get("objective_mode", objective_cfg.get("name", "legacy_macro_priority")))
+    ).strip().lower()
+    resolved_branch_macro_f1 = float(branch_macro_f1 if branch_macro_f1 is not None else macro_f1)
     graduate_drop_penalty = max(0.0, baseline_graduate_f1 - graduate_f1 - tolerance)
     enrolled_floor_penalty = max(0.0, enrolled_floor - enrolled_f1)
-    score_raw = (gamma * macro_f1) + (alpha * enrolled_f1) - (beta * graduate_drop_penalty) - enrolled_floor_penalty
+    if objective_mode == "enrolled_priority":
+        score_raw = (
+            enrolled_f1 * 1000.0
+            + resolved_branch_macro_f1 * 100.0
+            + macro_f1 * 10.0
+            + graduate_f1
+            - (beta * graduate_drop_penalty)
+            - enrolled_floor_penalty
+        )
+    else:
+        score_raw = (gamma * macro_f1) + (alpha * enrolled_f1) - (beta * graduate_drop_penalty) - enrolled_floor_penalty
     return {
+        "objective_mode": objective_mode,
         "macro_f1": macro_f1,
         "enrolled_f1": enrolled_f1,
         "graduate_f1": graduate_f1,
+        "branch_macro_f1": resolved_branch_macro_f1,
         "gamma_macro_f1": gamma,
         "alpha_enrolled_f1": alpha,
         "beta_graduate_drop_penalty": beta,
@@ -4498,16 +4520,308 @@ def _stage2_decision_policy_acceptance(
     epsilon = float(acceptance_cfg.get("macro_f1_improvement_epsilon", 0.001))
     min_enrolled_gain = float(acceptance_cfg.get("min_enrolled_f1_gain", 0.02))
     graduate_tolerance = float(acceptance_cfg.get("graduate_f1_tolerance_vs_baseline", 0.02))
-    accepted = bool((macro_delta >= epsilon) or (enrolled_delta >= min_enrolled_gain and graduate_delta >= (-graduate_tolerance)))
+    max_final_macro_f1_drop = float(acceptance_cfg.get("max_final_macro_f1_drop", epsilon))
+    metric_mode = str(acceptance_cfg.get("metric", "macro_or_enrolled_guarded")).strip().lower()
+    if metric_mode == "enrolled_priority_guarded":
+        accepted = bool(
+            enrolled_delta >= min_enrolled_gain
+            and macro_delta >= (-max_final_macro_f1_drop)
+            and graduate_delta >= (-graduate_tolerance)
+        )
+        if enrolled_delta < min_enrolled_gain:
+            reason = "rejected_enrolled_gain_below_epsilon"
+        elif macro_delta < (-max_final_macro_f1_drop):
+            reason = "rejected_final_macro_guard"
+        elif graduate_delta < (-graduate_tolerance):
+            reason = "rejected_graduate_guard"
+        else:
+            reason = "accepted"
+    else:
+        accepted = bool((macro_delta >= epsilon) or (enrolled_delta >= min_enrolled_gain and graduate_delta >= (-graduate_tolerance)))
+        reason = "accepted" if accepted else "rejected_fallback_to_baseline"
     return {
         "accepted": accepted,
+        "metric": metric_mode,
         "macro_f1_delta": float(macro_delta),
         "enrolled_f1_delta": float(enrolled_delta),
         "graduate_f1_delta": float(graduate_delta),
         "macro_f1_improvement_epsilon": float(epsilon),
         "min_enrolled_f1_gain": float(min_enrolled_gain),
         "graduate_f1_tolerance_vs_baseline": float(graduate_tolerance),
-        "reason": "accepted" if accepted else "rejected_fallback_to_baseline",
+        "max_final_macro_f1_drop": float(max_final_macro_f1_drop),
+        "reason": reason,
+    }
+
+
+def _select_two_stage_stage2_decision_on_full_validation(
+    *,
+    decision_mode: str,
+    y_true_valid: pd.Series,
+    fused_proba_valid: np.ndarray,
+    labels: list[int],
+    dropout_idx: int,
+    enrolled_idx: int,
+    graduate_idx: int,
+    dropout_threshold: float,
+    low_threshold: float | None,
+    high_threshold: float | None,
+    class_thresholds: dict[int, float] | None,
+    stage2_prob_enrolled_valid: np.ndarray,
+    stage2_prob_graduate_valid: np.ndarray,
+    y_true_valid_stage2: pd.Series,
+    stage2_prob_enrolled_valid_stage2: np.ndarray,
+    stage2_prob_graduate_valid_stage2: np.ndarray,
+    stage2_decision_cfg: dict[str, Any],
+) -> dict[str, Any]:
+    resolved_cfg = dict(stage2_decision_cfg) if isinstance(stage2_decision_cfg, dict) else {"enabled": False, "strategy": "argmax"}
+    baseline_cfg = {"enabled": False, "strategy": "argmax"}
+    label_order = [int(v) for v in labels]
+    baseline_final_eval = _evaluate_two_stage_policy_on_split(
+        y_true=y_true_valid,
+        fused_proba=np.asarray(fused_proba_valid, dtype=float),
+        labels=label_order,
+        decision_mode=decision_mode,
+        dropout_idx=dropout_idx,
+        enrolled_idx=enrolled_idx,
+        graduate_idx=graduate_idx,
+        dropout_threshold=float(dropout_threshold),
+        low_threshold=low_threshold,
+        high_threshold=high_threshold,
+        class_thresholds=class_thresholds,
+        stage2_prob_enrolled=np.asarray(stage2_prob_enrolled_valid, dtype=float),
+        stage2_prob_graduate=np.asarray(stage2_prob_graduate_valid, dtype=float),
+        stage2_decision_config=baseline_cfg,
+    )
+    baseline_final_pred = np.asarray(baseline_final_eval["y_pred"], dtype=int)
+    baseline_final_per_class = compute_per_class_metrics(y_true_valid, baseline_final_pred, labels=label_order)
+    stage2_subset_base_pred = np.where(
+        np.asarray(stage2_prob_enrolled_valid_stage2, dtype=float) >= np.asarray(stage2_prob_graduate_valid_stage2, dtype=float),
+        int(enrolled_idx),
+        int(graduate_idx),
+    ).astype(int)
+    baseline_stage2_metrics = compute_metrics(y_true_valid_stage2, stage2_subset_base_pred)
+    baseline_stage2_per_class = compute_per_class_metrics(
+        y_true_valid_stage2,
+        stage2_subset_base_pred,
+        labels=[int(enrolled_idx), int(graduate_idx)],
+    )
+    baseline_components = _compute_stage2_decision_objective_components(
+        metrics=baseline_final_eval["metrics"],
+        per_class=baseline_final_per_class,
+        enrolled_idx=enrolled_idx,
+        graduate_idx=graduate_idx,
+        objective_cfg=resolved_cfg.get("objective", {}),
+        baseline_graduate_f1=float(baseline_final_per_class.get(str(graduate_idx), {}).get("f1", 0.0)),
+        branch_macro_f1=float(baseline_stage2_metrics.get("macro_f1", 0.0)),
+    )
+    if not bool(resolved_cfg.get("enabled", False)):
+        return {
+            "status": "skipped",
+            "reason": "stage2_decision_disabled",
+            "enabled": False,
+            "strategy": "argmax",
+            "threshold_tuning_requested": False,
+            "threshold_tuning_applied": False,
+            "threshold_tuning_supported": True,
+            "selection_split": "validation",
+            "selected_config": baseline_cfg,
+            "baseline_validation_metrics": baseline_stage2_metrics,
+            "baseline_validation_per_class": baseline_stage2_per_class,
+            "tuned_validation_metrics": baseline_stage2_metrics,
+            "tuned_validation_per_class": baseline_stage2_per_class,
+            "validation_final_metrics_baseline": dict(baseline_final_eval.get("metrics", {})),
+            "validation_final_metrics_selected": dict(baseline_final_eval.get("metrics", {})),
+            "validation_objective_score_baseline": float(baseline_components.get("score_normalized", 0.0)),
+            "validation_objective_score_selected": float(baseline_components.get("score_normalized", 0.0)),
+            "objective_components_baseline": baseline_components,
+            "objective_components_selected": baseline_components,
+            "search_results": [],
+            "search_evaluated_candidates": 0,
+            "acceptance": {
+                "accepted": False,
+                "metric": str(resolved_cfg.get("acceptance", {}).get("metric", "macro_or_enrolled_guarded")),
+                "reason": "stage2_decision_disabled",
+            },
+            "selected_validation_predictions": baseline_final_pred.tolist(),
+            "selected_validation_decision_reasons": _build_stage2_fallback_reason_array(len(y_true_valid), reason="argmax"),
+        }
+
+    default_cfg = {
+        "enabled": True,
+        "strategy": "enrolled_guarded_threshold",
+        "mode": str(resolved_cfg.get("mode", "legacy")).strip().lower(),
+        "enrolled_probability_threshold": float(resolved_cfg.get("enrolled_probability_threshold", 0.42)),
+        "graduate_margin_guard": float(resolved_cfg.get("graduate_margin_guard", 0.06)),
+        "enrolled_margin": float(resolved_cfg.get("enrolled_margin", -float(resolved_cfg.get("graduate_margin_guard", 0.06)))),
+        "dropout_probability_guard": float(resolved_cfg.get("dropout_probability_guard", 1.0)),
+        "use_calibrated_proba": bool(resolved_cfg.get("use_calibrated_proba", False)),
+        "calibration_method": str(resolved_cfg.get("calibration_method", "none")).strip().lower(),
+    }
+    candidate_cfgs: list[dict[str, Any]] = []
+    if bool(resolved_cfg.get("tune_on_validation", True)):
+        for threshold in resolved_cfg.get("search", {}).get("enrolled_probability_threshold_grid", []):
+            for margin_guard in resolved_cfg.get("search", {}).get("graduate_margin_guard_grid", []):
+                for enrolled_margin in resolved_cfg.get("search", {}).get("enrolled_margin_grid", []):
+                    for dropout_probability_guard in resolved_cfg.get("search", {}).get("dropout_probability_guard_grid", []):
+                        candidate_cfgs.append(
+                            {
+                                **default_cfg,
+                                "enrolled_probability_threshold": float(threshold),
+                                "graduate_margin_guard": float(margin_guard),
+                                "enrolled_margin": float(enrolled_margin),
+                                "dropout_probability_guard": float(dropout_probability_guard),
+                            }
+                        )
+    else:
+        candidate_cfgs = [dict(default_cfg)]
+    if not candidate_cfgs:
+        candidate_cfgs = [dict(default_cfg)]
+
+    best_cfg = dict(default_cfg)
+    best_final_eval = baseline_final_eval
+    best_final_per_class = baseline_final_per_class
+    best_stage2_metrics = baseline_stage2_metrics
+    best_stage2_per_class = baseline_stage2_per_class
+    best_reasons = _build_stage2_fallback_reason_array(len(y_true_valid), reason="argmax")
+    best_components = baseline_components
+    best_rank = (
+        float(baseline_components.get("enrolled_f1", 0.0)),
+        float(baseline_components.get("branch_macro_f1", 0.0)),
+        float(baseline_components.get("macro_f1", 0.0)),
+        float(baseline_components.get("graduate_f1", 0.0)),
+        -abs(float(default_cfg.get("enrolled_probability_threshold", 0.5)) - 0.5),
+        -float(default_cfg.get("graduate_margin_guard", 0.0)),
+        -abs(float(default_cfg.get("enrolled_margin", 0.0))),
+    )
+    candidate_rows: list[dict[str, Any]] = []
+    for candidate_cfg in candidate_cfgs:
+        final_eval = _evaluate_two_stage_policy_on_split(
+            y_true=y_true_valid,
+            fused_proba=np.asarray(fused_proba_valid, dtype=float),
+            labels=label_order,
+            decision_mode=decision_mode,
+            dropout_idx=dropout_idx,
+            enrolled_idx=enrolled_idx,
+            graduate_idx=graduate_idx,
+            dropout_threshold=float(dropout_threshold),
+            low_threshold=low_threshold,
+            high_threshold=high_threshold,
+            class_thresholds=class_thresholds,
+            stage2_prob_enrolled=np.asarray(stage2_prob_enrolled_valid, dtype=float),
+            stage2_prob_graduate=np.asarray(stage2_prob_graduate_valid, dtype=float),
+            stage2_decision_config=candidate_cfg,
+        )
+        final_pred = np.asarray(final_eval["y_pred"], dtype=int)
+        final_per_class = compute_per_class_metrics(y_true_valid, final_pred, labels=label_order)
+        _, final_reasons = TwoStageUct3ClassClassifier.apply_stage2_decision_policy(
+            final_pred,
+            p_enrolled_given_non_dropout=np.asarray(stage2_prob_enrolled_valid, dtype=float),
+            p_graduate_given_non_dropout=np.asarray(stage2_prob_graduate_valid, dtype=float),
+            p_dropout=None,
+            dropout_label=int(dropout_idx),
+            enrolled_label=int(enrolled_idx),
+            graduate_label=int(graduate_idx),
+            stage2_decision_config=candidate_cfg,
+        )
+        stage2_pred, stage2_reasons = TwoStageUct3ClassClassifier.apply_stage2_decision_policy(
+            stage2_subset_base_pred,
+            p_enrolled_given_non_dropout=np.asarray(stage2_prob_enrolled_valid_stage2, dtype=float),
+            p_graduate_given_non_dropout=np.asarray(stage2_prob_graduate_valid_stage2, dtype=float),
+            p_dropout=None,
+            dropout_label=-1,
+            enrolled_label=int(enrolled_idx),
+            graduate_label=int(graduate_idx),
+            stage2_decision_config=candidate_cfg,
+        )
+        stage2_metrics = compute_metrics(y_true_valid_stage2, stage2_pred)
+        stage2_per_class = compute_per_class_metrics(
+            y_true_valid_stage2,
+            stage2_pred,
+            labels=[int(enrolled_idx), int(graduate_idx)],
+        )
+        components = _compute_stage2_decision_objective_components(
+            metrics=final_eval["metrics"],
+            per_class=final_per_class,
+            enrolled_idx=enrolled_idx,
+            graduate_idx=graduate_idx,
+            objective_cfg=resolved_cfg.get("objective", {}),
+            baseline_graduate_f1=float(baseline_final_per_class.get(str(graduate_idx), {}).get("f1", 0.0)),
+            branch_macro_f1=float(stage2_metrics.get("macro_f1", 0.0)),
+        )
+        candidate_rows.append(
+            {
+                "enrolled_probability_threshold": float(candidate_cfg.get("enrolled_probability_threshold", np.nan)),
+                "graduate_margin_guard": float(candidate_cfg.get("graduate_margin_guard", np.nan)),
+                "enrolled_margin": float(candidate_cfg.get("enrolled_margin", np.nan)),
+                "dropout_probability_guard": float(candidate_cfg.get("dropout_probability_guard", np.nan)),
+                "objective_mode": str(components.get("objective_mode", "")),
+                "objective_score": float(components.get("score_normalized", 0.0)),
+                "final_valid_enrolled_f1": float(components.get("enrolled_f1", 0.0)),
+                "stage2_branch_valid_macro_f1": float(stage2_metrics.get("macro_f1", 0.0)),
+                "final_valid_macro_f1": float(components.get("macro_f1", 0.0)),
+                "final_valid_graduate_f1": float(components.get("graduate_f1", 0.0)),
+            }
+        )
+        rank = (
+            float(components.get("enrolled_f1", 0.0)),
+            float(stage2_metrics.get("macro_f1", 0.0)),
+            float(components.get("macro_f1", 0.0)),
+            float(components.get("graduate_f1", 0.0)),
+            -abs(float(candidate_cfg["enrolled_probability_threshold"]) - 0.5),
+            -float(candidate_cfg["graduate_margin_guard"]),
+            -abs(float(candidate_cfg["enrolled_margin"])),
+        )
+        if rank > best_rank:
+            best_cfg = dict(candidate_cfg)
+            best_final_eval = final_eval
+            best_final_per_class = final_per_class
+            best_stage2_metrics = stage2_metrics
+            best_stage2_per_class = stage2_per_class
+            best_reasons = np.asarray(final_reasons, dtype=str).tolist()
+            best_components = components
+            best_rank = rank
+
+    acceptance = _stage2_decision_policy_acceptance(
+        baseline_metrics=baseline_final_eval["metrics"],
+        baseline_per_class=baseline_final_per_class,
+        tuned_metrics=best_final_eval["metrics"],
+        tuned_per_class=best_final_per_class,
+        enrolled_idx=enrolled_idx,
+        graduate_idx=graduate_idx,
+        acceptance_cfg=resolved_cfg.get("acceptance", {}),
+    )
+    accepted = bool(acceptance.get("accepted", False))
+    selected_cfg = best_cfg if accepted else baseline_cfg
+    selected_final_eval = best_final_eval if accepted else baseline_final_eval
+    selected_stage2_metrics = best_stage2_metrics if accepted else baseline_stage2_metrics
+    selected_stage2_per_class = best_stage2_per_class if accepted else baseline_stage2_per_class
+    selected_components = best_components if accepted else baseline_components
+    selected_reasons = best_reasons if accepted else _build_stage2_fallback_reason_array(len(y_true_valid), reason="argmax")
+    return {
+        "status": "applied" if accepted else "rejected",
+        "reason": "stage2_decision_full_validation_search_completed" if accepted else str(acceptance.get("reason", "rejected_fallback_to_baseline")),
+        "enabled": True,
+        "strategy": "enrolled_guarded_threshold",
+        "threshold_tuning_requested": bool(resolved_cfg.get("tune_on_validation", True)),
+        "threshold_tuning_applied": bool(resolved_cfg.get("tune_on_validation", True)),
+        "threshold_tuning_supported": True,
+        "selection_split": "validation",
+        "selected_config": selected_cfg,
+        "baseline_validation_metrics": baseline_stage2_metrics,
+        "baseline_validation_per_class": baseline_stage2_per_class,
+        "tuned_validation_metrics": selected_stage2_metrics,
+        "tuned_validation_per_class": selected_stage2_per_class,
+        "validation_final_metrics_baseline": dict(baseline_final_eval.get("metrics", {})),
+        "validation_final_metrics_selected": dict(selected_final_eval.get("metrics", {})),
+        "validation_objective_score_baseline": float(baseline_components.get("score_normalized", 0.0)),
+        "validation_objective_score_selected": float(selected_components.get("score_normalized", 0.0)),
+        "objective_components_baseline": baseline_components,
+        "objective_components_selected": selected_components,
+        "acceptance": acceptance,
+        "search_results": candidate_rows,
+        "search_evaluated_candidates": int(len(candidate_rows)),
+        "selected_validation_predictions": np.asarray(selected_final_eval["y_pred"], dtype=int).tolist(),
+        "selected_validation_decision_reasons": list(selected_reasons),
     }
 
 
@@ -7059,21 +7373,47 @@ def _run_two_stage_uct_model(
             graduate_label=int(graduate_idx),
             stage2_decision_config=selected_stage2_decision_cfg,
         )
-    stage2_acceptance_meta = (
-        stage2_decision_tuning_result.get("acceptance", {})
-        if isinstance(stage2_decision_tuning_result.get("acceptance", {}), dict)
-        else {}
-    )
     requested_stage2_decision = _was_stage2_decision_requested(stage2_decision_cfg)
+    preserved_stage2_meta = {
+        key: stage2_decision_tuning_result.get(key)
+        for key in ("selection_split", "anti_overfit_strategy", "inner_split", "calibration", "optuna", "selected_stage2_weights")
+        if isinstance(stage2_decision_tuning_result, dict) and key in stage2_decision_tuning_result
+    }
+    stage2_decision_tuning_result = {
+        **_select_two_stage_stage2_decision_on_full_validation(
+            decision_mode=decision_mode,
+            y_true_valid=y_valid,
+            fused_proba_valid=np.asarray(y_proba_valid_final, dtype=float),
+            labels=label_order,
+            dropout_idx=dropout_idx,
+            enrolled_idx=enrolled_idx,
+            graduate_idx=graduate_idx,
+            dropout_threshold=float(selected_dropout_threshold),
+            low_threshold=float(selected_low_threshold),
+            high_threshold=float(selected_high_threshold),
+            class_thresholds=class_thresholds,
+            stage2_prob_enrolled_valid=np.asarray(stage_prob_valid.get("stage2_prob_enrolled", []), dtype=float),
+            stage2_prob_graduate_valid=np.asarray(stage_prob_valid.get("stage2_prob_graduate", []), dtype=float),
+            y_true_valid_stage2=y_valid.loc[valid_mask_stage2].reset_index(drop=True),
+            stage2_prob_enrolled_valid_stage2=np.asarray(stage_prob_valid.get("stage2_prob_enrolled", []), dtype=float)[
+                np.asarray(valid_mask_stage2, dtype=bool)
+            ],
+            stage2_prob_graduate_valid_stage2=np.asarray(stage_prob_valid.get("stage2_prob_graduate", []), dtype=float)[
+                np.asarray(valid_mask_stage2, dtype=bool)
+            ],
+            stage2_decision_cfg=stage2_decision_cfg,
+        ),
+        **preserved_stage2_meta,
+    }
     executed_stage2_decision = _was_stage2_decision_executed(stage2_decision_tuning_result)
-    full_valid_macro_guard = float(
-        stage2_decision_cfg.get("acceptance", {}).get("max_final_macro_f1_drop", 0.002)
-        if isinstance(stage2_decision_cfg.get("acceptance", {}), dict)
-        else 0.002
+    stage2_decision_tuning_result["requested"] = bool(requested_stage2_decision)
+    stage2_decision_tuning_result["executed"] = bool(executed_stage2_decision)
+    selected_stage2_decision_cfg = (
+        stage2_decision_tuning_result.get("selected_config", {"enabled": False, "strategy": "argmax"})
+        if isinstance(stage2_decision_tuning_result, dict)
+        else {"enabled": False, "strategy": "argmax"}
     )
-    baseline_stage2_decision_cfg = {"enabled": False, "strategy": "argmax"}
-    full_valid_baseline_eval = _evaluate_two_stage_policy_on_split(
-        y_true=y_valid,
+    y_pred_valid_final, valid_decision_regions = _predict_two_stage_from_fused_probabilities(
         fused_proba=np.asarray(y_proba_valid_final, dtype=float),
         labels=label_order,
         decision_mode=decision_mode,
@@ -7083,50 +7423,48 @@ def _run_two_stage_uct_model(
         dropout_threshold=float(selected_dropout_threshold),
         low_threshold=float(selected_low_threshold),
         high_threshold=float(selected_high_threshold),
-        class_thresholds=class_thresholds,
         stage2_prob_enrolled=np.asarray(stage_prob_valid.get("stage2_prob_enrolled", []), dtype=float),
         stage2_prob_graduate=np.asarray(stage_prob_valid.get("stage2_prob_graduate", []), dtype=float),
-        stage2_decision_config=baseline_stage2_decision_cfg,
+        stage2_decision_config=selected_stage2_decision_cfg,
     )
-    full_valid_selected_metrics = compute_metrics(y_valid, np.asarray(y_pred_valid_final, dtype=int))
-    stage2_decision_tuning_result["requested"] = bool(requested_stage2_decision)
-    stage2_decision_tuning_result["executed"] = bool(executed_stage2_decision)
-    stage2_decision_tuning_result["validation_final_metrics_baseline"] = dict(full_valid_baseline_eval.get("metrics", {}))
-    stage2_decision_tuning_result["validation_final_metrics_selected"] = dict(full_valid_selected_metrics)
-    stage2_decision_tuning_result["validation_final_macro_f1_baseline"] = float(
-        full_valid_baseline_eval.get("metrics", {}).get("macro_f1", np.nan)
+    y_pred_test_final, test_decision_regions = _predict_two_stage_from_fused_probabilities(
+        fused_proba=np.asarray(y_proba_test_final, dtype=float),
+        labels=label_order,
+        decision_mode=decision_mode,
+        dropout_idx=dropout_idx,
+        enrolled_idx=enrolled_idx,
+        graduate_idx=graduate_idx,
+        dropout_threshold=float(selected_dropout_threshold),
+        low_threshold=float(selected_low_threshold),
+        high_threshold=float(selected_high_threshold),
+        stage2_prob_enrolled=np.asarray(stage_prob_test.get("stage2_prob_enrolled", []), dtype=float),
+        stage2_prob_graduate=np.asarray(stage_prob_test.get("stage2_prob_graduate", []), dtype=float),
+        stage2_decision_config=selected_stage2_decision_cfg,
     )
-    stage2_decision_tuning_result["validation_final_macro_f1_selected"] = float(
-        full_valid_selected_metrics.get("macro_f1", np.nan)
+    _, valid_stage2_decision_reason = TwoStageUct3ClassClassifier.apply_stage2_decision_policy(
+        np.asarray(y_pred_valid_final, dtype=int),
+        p_enrolled_given_non_dropout=np.asarray(stage_prob_valid.get("stage2_prob_enrolled", []), dtype=float),
+        p_graduate_given_non_dropout=np.asarray(stage_prob_valid.get("stage2_prob_graduate", []), dtype=float),
+        dropout_label=int(dropout_idx),
+        enrolled_label=int(enrolled_idx),
+        graduate_label=int(graduate_idx),
+        stage2_decision_config=selected_stage2_decision_cfg,
     )
-    stage2_decision_tuning_result["validation_final_macro_f1_delta"] = float(
-        full_valid_selected_metrics.get("macro_f1", 0.0) - full_valid_baseline_eval.get("metrics", {}).get("macro_f1", 0.0)
+    _, test_stage2_decision_reason = TwoStageUct3ClassClassifier.apply_stage2_decision_policy(
+        np.asarray(y_pred_test_final, dtype=int),
+        p_enrolled_given_non_dropout=np.asarray(stage_prob_test.get("stage2_prob_enrolled", []), dtype=float),
+        p_graduate_given_non_dropout=np.asarray(stage_prob_test.get("stage2_prob_graduate", []), dtype=float),
+        dropout_label=int(dropout_idx),
+        enrolled_label=int(enrolled_idx),
+        graduate_label=int(graduate_idx),
+        stage2_decision_config=selected_stage2_decision_cfg,
     )
-    if requested_stage2_decision and bool(selected_stage2_decision_cfg.get("enabled", False)):
-        final_macro_delta = float(stage2_decision_tuning_result["validation_final_macro_f1_delta"])
-        stage2_acceptance_meta["final_validation_macro_f1_before"] = float(
-            full_valid_baseline_eval.get("metrics", {}).get("macro_f1", np.nan)
-        )
-        stage2_acceptance_meta["final_validation_macro_f1_after"] = float(
-            full_valid_selected_metrics.get("macro_f1", np.nan)
-        )
-        stage2_acceptance_meta["final_validation_macro_f1_delta"] = float(final_macro_delta)
-        stage2_acceptance_meta["max_final_macro_f1_drop"] = float(full_valid_macro_guard)
-        if final_macro_delta < (-float(full_valid_macro_guard)):
-            stage2_acceptance_meta["accepted"] = False
-            stage2_acceptance_meta["reason"] = "rejected_full_validation_macro_guard"
-            stage2_decision_tuning_result["status"] = "rejected"
-            stage2_decision_tuning_result["reason"] = "rejected_full_validation_macro_guard"
-            stage2_decision_tuning_result["selected_config"] = dict(baseline_stage2_decision_cfg)
-            stage2_decision_tuning_result["validation_final_metrics_selected"] = dict(full_valid_baseline_eval.get("metrics", {}))
-            stage2_decision_tuning_result["validation_final_macro_f1_selected"] = float(
-                full_valid_baseline_eval.get("metrics", {}).get("macro_f1", np.nan)
-            )
-            selected_stage2_decision_cfg = dict(baseline_stage2_decision_cfg)
-            y_pred_valid_final = np.asarray(full_valid_baseline_eval["y_pred"], dtype=int)
-            valid_decision_regions = np.asarray(full_valid_baseline_eval["decision_regions"], dtype=str)
-            y_pred_test_final, test_decision_regions = _predict_two_stage_from_fused_probabilities(
-                fused_proba=np.asarray(y_proba_test_final, dtype=float),
+    baseline_final_per_class = compute_per_class_metrics(
+        y_valid,
+        np.asarray(
+            _evaluate_two_stage_policy_on_split(
+                y_true=y_valid,
+                fused_proba=np.asarray(y_proba_valid_final, dtype=float),
                 labels=label_order,
                 decision_mode=decision_mode,
                 dropout_idx=dropout_idx,
@@ -7135,28 +7473,61 @@ def _run_two_stage_uct_model(
                 dropout_threshold=float(selected_dropout_threshold),
                 low_threshold=float(selected_low_threshold),
                 high_threshold=float(selected_high_threshold),
-                stage2_prob_enrolled=np.asarray(stage_prob_test.get("stage2_prob_enrolled", []), dtype=float),
-                stage2_prob_graduate=np.asarray(stage_prob_test.get("stage2_prob_graduate", []), dtype=float),
-                stage2_decision_config=selected_stage2_decision_cfg,
-            )
-            _, valid_stage2_decision_reason = TwoStageUct3ClassClassifier.apply_stage2_decision_policy(
-                np.asarray(y_pred_valid_final, dtype=int),
-                p_enrolled_given_non_dropout=np.asarray(stage_prob_valid.get("stage2_prob_enrolled", []), dtype=float),
-                p_graduate_given_non_dropout=np.asarray(stage_prob_valid.get("stage2_prob_graduate", []), dtype=float),
-                dropout_label=int(dropout_idx),
-                enrolled_label=int(enrolled_idx),
-                graduate_label=int(graduate_idx),
-                stage2_decision_config=selected_stage2_decision_cfg,
-            )
-            _, test_stage2_decision_reason = TwoStageUct3ClassClassifier.apply_stage2_decision_policy(
-                np.asarray(y_pred_test_final, dtype=int),
-                p_enrolled_given_non_dropout=np.asarray(stage_prob_test.get("stage2_prob_enrolled", []), dtype=float),
-                p_graduate_given_non_dropout=np.asarray(stage_prob_test.get("stage2_prob_graduate", []), dtype=float),
-                dropout_label=int(dropout_idx),
-                enrolled_label=int(enrolled_idx),
-                graduate_label=int(graduate_idx),
-                stage2_decision_config=selected_stage2_decision_cfg,
-            )
+                class_thresholds=class_thresholds,
+                stage2_prob_enrolled=np.asarray(stage_prob_valid.get("stage2_prob_enrolled", []), dtype=float),
+                stage2_prob_graduate=np.asarray(stage_prob_valid.get("stage2_prob_graduate", []), dtype=float),
+                stage2_decision_config={"enabled": False, "strategy": "argmax"},
+            )["y_pred"],
+            dtype=int,
+        ),
+        labels=label_order,
+    )
+    selected_final_per_class = compute_per_class_metrics(y_valid, np.asarray(y_pred_valid_final, dtype=int), labels=label_order)
+    stage2_decision_tuning_result["validation_final_macro_f1_baseline"] = float(
+        stage2_decision_tuning_result.get("validation_final_metrics_baseline", {}).get("macro_f1", np.nan)
+    )
+    stage2_decision_tuning_result["validation_final_macro_f1_selected"] = float(
+        stage2_decision_tuning_result.get("validation_final_metrics_selected", {}).get("macro_f1", np.nan)
+    )
+    stage2_decision_tuning_result["validation_final_macro_f1_delta"] = float(
+        float(stage2_decision_tuning_result.get("validation_final_metrics_selected", {}).get("macro_f1", 0.0))
+        - float(stage2_decision_tuning_result.get("validation_final_metrics_baseline", {}).get("macro_f1", 0.0))
+    )
+    stage2_decision_tuning_result["validation_final_enrolled_f1_baseline"] = float(
+        baseline_final_per_class.get(str(enrolled_idx), {}).get("f1", np.nan)
+    )
+    stage2_decision_tuning_result["validation_final_enrolled_f1_selected"] = float(
+        selected_final_per_class.get(str(enrolled_idx), {}).get("f1", np.nan)
+    )
+    stage2_decision_tuning_result["validation_final_graduate_f1_baseline"] = float(
+        baseline_final_per_class.get(str(graduate_idx), {}).get("f1", np.nan)
+    )
+    stage2_decision_tuning_result["validation_final_graduate_f1_selected"] = float(
+        selected_final_per_class.get(str(graduate_idx), {}).get("f1", np.nan)
+    )
+    stage2_acceptance_meta = (
+        stage2_decision_tuning_result.get("acceptance", {})
+        if isinstance(stage2_decision_tuning_result.get("acceptance", {}), dict)
+        else {}
+    )
+    stage2_acceptance_meta["final_validation_enrolled_f1_before"] = float(
+        stage2_decision_tuning_result.get("validation_final_enrolled_f1_baseline", np.nan)
+    )
+    stage2_acceptance_meta["final_validation_enrolled_f1_after"] = float(
+        stage2_decision_tuning_result.get("validation_final_enrolled_f1_selected", np.nan)
+    )
+    stage2_acceptance_meta["final_validation_macro_f1_before"] = float(
+        stage2_decision_tuning_result.get("validation_final_macro_f1_baseline", np.nan)
+    )
+    stage2_acceptance_meta["final_validation_macro_f1_after"] = float(
+        stage2_decision_tuning_result.get("validation_final_macro_f1_selected", np.nan)
+    )
+    stage2_acceptance_meta["final_validation_graduate_f1_before"] = float(
+        stage2_decision_tuning_result.get("validation_final_graduate_f1_baseline", np.nan)
+    )
+    stage2_acceptance_meta["final_validation_graduate_f1_after"] = float(
+        stage2_decision_tuning_result.get("validation_final_graduate_f1_selected", np.nan)
+    )
     stage2_decision_tuning_result["acceptance"] = stage2_acceptance_meta
     combined_model.threshold_stage1 = float(selected_dropout_threshold)
     combined_model.threshold_stage1_low = float(selected_low_threshold)
@@ -7194,6 +7565,10 @@ def _run_two_stage_uct_model(
             else {}
         )
         print(
+            "[two_stage][stage2_decision] "
+            f"objective_mode={objective_meta.get('objective_mode', stage2_decision_cfg.get('objective', {}).get('mode', 'legacy_macro_priority'))}"
+        )
+        print(
             f"[two_stage][{model_name}] stage2_decision="
             f"{stage2_decision_tuning_result.get('status', 'skipped')} "
             f"anti_overfit={stage2_decision_tuning_result.get('anti_overfit_strategy', 'validation')} "
@@ -7213,6 +7588,7 @@ def _run_two_stage_uct_model(
         print(
             "[two_stage][stage2_decision] "
             f"model={model_name} "
+            f"objective_mode={stage2_decision_tuning_result.get('objective_components_selected', {}).get('objective_mode', stage2_decision_cfg.get('objective', {}).get('mode', 'legacy_macro_priority'))} "
             f"requested={bool(stage2_decision_tuning_result.get('requested', requested_stage2_decision))} "
             f"search_started={bool(stage2_decision_tuning_result.get('threshold_tuning_requested', False))} "
             f"executed={bool(stage2_decision_tuning_result.get('executed', executed_stage2_decision))} "
@@ -7224,10 +7600,15 @@ def _run_two_stage_uct_model(
         print(
             "[two_stage][stage2_decision] "
             f"model={model_name} "
+            f"enrolled_f1_before={float(stage2_decision_tuning_result.get('validation_final_enrolled_f1_baseline', np.nan)):.6f} "
+            f"enrolled_f1_after={float(stage2_decision_tuning_result.get('validation_final_enrolled_f1_selected', np.nan)):.6f} "
             f"validation_branch_macro_f1_before={float(stage2_decision_tuning_result.get('baseline_validation_metrics', {}).get('macro_f1', np.nan)):.6f} "
             f"validation_branch_macro_f1_after={float(stage2_decision_tuning_result.get('tuned_validation_metrics', {}).get('macro_f1', np.nan)):.6f} "
-            f"validation_final_macro_f1_before={float(stage2_decision_tuning_result.get('validation_final_macro_f1_baseline', np.nan)):.6f} "
-            f"validation_final_macro_f1_after={float(stage2_decision_tuning_result.get('validation_final_macro_f1_selected', np.nan)):.6f}"
+            f"final_macro_f1_before={float(stage2_decision_tuning_result.get('validation_final_macro_f1_baseline', np.nan)):.6f} "
+            f"final_macro_f1_after={float(stage2_decision_tuning_result.get('validation_final_macro_f1_selected', np.nan)):.6f} "
+            f"graduate_f1_before={float(stage2_decision_tuning_result.get('validation_final_graduate_f1_baseline', np.nan)):.6f} "
+            f"graduate_f1_after={float(stage2_decision_tuning_result.get('validation_final_graduate_f1_selected', np.nan)):.6f} "
+            f"trials={int(stage2_decision_tuning_result.get('search_evaluated_candidates', 0))}"
         )
 
     metrics: dict[str, float] = {}
@@ -7490,10 +7871,22 @@ def _run_two_stage_uct_model(
         else 0.0
     )
     payload["metrics"]["stage2_decision_status"] = str(stage2_decision_tuning_result.get("status", "skipped"))
+    payload["metrics"]["stage2_decision_objective_mode"] = str(
+        stage2_decision_tuning_result.get("objective_components_selected", {}).get(
+            "objective_mode",
+            stage2_decision_cfg.get("objective", {}).get("mode", "legacy_macro_priority"),
+        )
+    )
     payload["metrics"]["stage2_decision_reject_reason"] = str(stage2_decision_tuning_result.get("reason", ""))
     payload["metrics"]["stage2_decision_rule"] = _stage2_decision_rule_string(selected_stage2_decision_cfg)
     payload["metrics"]["stage2_decision_enabled"] = (
         1.0 if bool(selected_stage2_decision_cfg.get("enabled", False)) else 0.0
+    )
+    payload["metrics"]["stage2_decision_threshold"] = float(
+        selected_stage2_decision_cfg.get("enrolled_probability_threshold", np.nan)
+    )
+    payload["metrics"]["stage2_decision_margin"] = float(
+        selected_stage2_decision_cfg.get("enrolled_margin", np.nan)
     )
     payload["metrics"]["stage2_enrolled_probability_threshold"] = float(
         selected_stage2_decision_cfg.get("enrolled_probability_threshold", np.nan)
@@ -7554,6 +7947,18 @@ def _run_two_stage_uct_model(
     )
     payload["metrics"]["stage2_final_valid_macro_f1_after"] = float(
         stage2_decision_tuning_result.get("validation_final_macro_f1_selected", np.nan)
+    )
+    payload["metrics"]["stage2_final_valid_enrolled_f1_before"] = float(
+        stage2_decision_tuning_result.get("validation_final_enrolled_f1_baseline", np.nan)
+    )
+    payload["metrics"]["stage2_final_valid_enrolled_f1_after"] = float(
+        stage2_decision_tuning_result.get("validation_final_enrolled_f1_selected", np.nan)
+    )
+    payload["metrics"]["stage2_final_valid_graduate_f1_before"] = float(
+        stage2_decision_tuning_result.get("validation_final_graduate_f1_baseline", np.nan)
+    )
+    payload["metrics"]["stage2_final_valid_graduate_f1_after"] = float(
+        stage2_decision_tuning_result.get("validation_final_graduate_f1_selected", np.nan)
     )
     payload["metrics"]["test_prediction_rate_dropout"] = float(np.mean(np.asarray(y_pred_test_final, dtype=int) == int(dropout_idx)))
     payload["metrics"]["test_prediction_rate_enrolled"] = float(np.mean(np.asarray(y_pred_test_final, dtype=int) == int(enrolled_idx)))
@@ -8332,7 +8737,6 @@ def run_experiment(experiment_config_path: Path, compact_summary: bool | None = 
         exp_cfg=exp_cfg,
         dataset_cfg=load_yaml(dataset_cfg_path),
     )
-    requested_dataset_config = str(exp_cfg.get("experiment", {}).get("dataset_config", ""))
     requested_dataset_token = dataset_cfg_path.stem
     experiment_id = exp_cfg["experiment"]["id"]
     seed = int(exp_cfg["experiment"].get("seed", 42))
@@ -8359,12 +8763,23 @@ def run_experiment(experiment_config_path: Path, compact_summary: bool | None = 
         and dataset_source_cfg["format"] == "parquet"
         and dataset_source_cfg["split_mode"] == "predefined"
     ):
-        if resolved_dataset_token == "uci_student_presplit_parquet" and not dataset_source_cfg.get("valid_path"):
-            raise ValueError(
-                "Dataset lock violation for uci_student_presplit_parquet: "
-                "predefined parquet config must provide data_source.valid_path because this path is hard-locked "
-                "to use existing predefined splits without re-splitting."
-            )
+        if resolved_dataset_token == "uci_student_presplit_parquet":
+            raw_dataset_identity = str(dataset_cfg.get("dataset", {}).get("name", "")).strip()
+            if raw_dataset_identity != "uci_student_presplit_parquet":
+                raise ValueError(
+                    "Dataset identity mismatch for uci_student_presplit_parquet: "
+                    f"dataset.name={raw_dataset_identity!r} expected='uci_student_presplit_parquet'."
+                )
+            expected_train_path = "data/processed/uci/uci_12_03_train.parquet"
+            expected_test_path = "data/processed/uci/uci_12_03_test.parquet"
+            resolved_train_cfg_path = str(dataset_source_cfg.get("train_path", "")).replace("\\", "/")
+            resolved_test_cfg_path = str(dataset_source_cfg.get("test_path", "")).replace("\\", "/")
+            if resolved_train_cfg_path != expected_train_path or resolved_test_cfg_path != expected_test_path:
+                raise ValueError(
+                    "Dataset lock violation for uci_student_presplit_parquet: "
+                    f"expected train/test paths ({expected_train_path}, {expected_test_path}) but got "
+                    f"({resolved_train_cfg_path}, {resolved_test_cfg_path})."
+                )
         predefined_splits, dataset_name, id_column, source_target_col, dataset_source_meta = _build_predefined_uci_feature_splits(
             dataset_cfg,
             formulation=formulation,
@@ -8378,27 +8793,55 @@ def run_experiment(experiment_config_path: Path, compact_summary: bool | None = 
             predefined_splits["test"],
             exp_cfg.get("preprocessing", {}),
         )
-        valid_feature_df_raw = predefined_splits.get("valid")
-        if not isinstance(valid_feature_df_raw, pd.DataFrame):
-            raise ValueError(
-                "Predefined parquet dataset path requires an explicit validation split. "
-                f"dataset_config={dataset_cfg_path} resolved_dataset={resolved_dataset_token}"
-            )
-        valid_feature_df, valid_missing_meta = _drop_rows_with_missing_values(
-            valid_feature_df_raw,
-            exp_cfg.get("preprocessing", {}),
-        )
         if train_feature_df.empty:
             raise ValueError("UCI predefined parquet train split became empty after missing-value filtering.")
-        if valid_feature_df.empty:
-            raise ValueError("UCI predefined parquet valid split became empty after missing-value filtering.")
         if test_feature_df.empty:
             raise ValueError("UCI predefined parquet test split became empty after missing-value filtering.")
-        splits = {
-            "train": train_feature_df.reset_index(drop=True),
-            "valid": valid_feature_df.reset_index(drop=True),
-            "test": test_feature_df.reset_index(drop=True),
-        }
+        valid_feature_df_raw = predefined_splits.get("valid")
+        internal_valid_source = "predefined_valid" if isinstance(valid_feature_df_raw, pd.DataFrame) else "train_only"
+        effective_split_mode = (
+            "predefined_train_valid_test"
+            if isinstance(valid_feature_df_raw, pd.DataFrame)
+            else "train_test_with_internal_valid"
+        )
+        if isinstance(valid_feature_df_raw, pd.DataFrame):
+            valid_feature_df, valid_missing_meta = _drop_rows_with_missing_values(
+                valid_feature_df_raw,
+                exp_cfg.get("preprocessing", {}),
+            )
+            if valid_feature_df.empty:
+                raise ValueError("UCI predefined parquet valid split became empty after missing-value filtering.")
+            splits = {
+                "train": train_feature_df.reset_index(drop=True),
+                "valid": valid_feature_df.reset_index(drop=True),
+                "test": test_feature_df.reset_index(drop=True),
+            }
+        else:
+            validation_size = float(exp_cfg["splits"].get("validation_size", 0.2))
+            train_valid_split_cfg = SplitConfig(
+                test_size=validation_size,
+                validation_size=0.0,
+                random_state=seed,
+                stratify_column="target",
+            )
+            train_valid_splits = stratified_train_valid_test_split(train_feature_df, train_valid_split_cfg)
+            valid_feature_df = train_valid_splits["test"].reset_index(drop=True)
+            train_feature_df = train_valid_splits["train"].reset_index(drop=True)
+            valid_missing_meta = {
+                "enabled": True,
+                "mode": "internal_from_train_only",
+                "source_rows_before_split": int(len(predefined_splits["train"])),
+                "validation_size": float(validation_size),
+                "random_state": int(seed),
+                "stratify_column": "target",
+            }
+            if train_feature_df.empty or valid_feature_df.empty:
+                raise ValueError("Internal validation split from predefined train parquet produced an empty train or valid split.")
+            splits = {
+                "train": train_feature_df,
+                "valid": valid_feature_df,
+                "test": test_feature_df.reset_index(drop=True),
+            }
         missing_value_meta = {
             "enabled": True,
             "mode": "predefined_uci_parquet",
@@ -8406,7 +8849,14 @@ def run_experiment(experiment_config_path: Path, compact_summary: bool | None = 
             "valid": valid_missing_meta,
             "test": test_missing_meta,
             "source": dataset_source_meta,
+            "effective_split_mode": effective_split_mode,
+            "internal_valid_source": internal_valid_source,
         }
+        print(f"[dataset] train_path={dataset_source_cfg.get('train_path')}")
+        print(f"[dataset] test_path={dataset_source_cfg.get('test_path')}")
+        print(f"[dataset] valid_path={dataset_source_cfg.get('valid_path')}")
+        print(f"[dataset] split_mode={effective_split_mode}")
+        print(f"[dataset] internal_valid_source={internal_valid_source}")
         print(
             "[dataset][uci] "
             f"source_format={dataset_source_meta.get('source_format')} "
@@ -9237,6 +9687,8 @@ def run_experiment(experiment_config_path: Path, compact_summary: bool | None = 
             "path": str(dataset_cfg_path),
             "source_format": dataset_source_cfg.get("format"),
             "split_mode": dataset_source_cfg.get("split_mode"),
+            "effective_split_mode": missing_value_meta.get("effective_split_mode"),
+            "internal_valid_source": missing_value_meta.get("internal_valid_source"),
             "train_path": dataset_source_cfg.get("train_path"),
             "valid_path": dataset_source_cfg.get("valid_path"),
             "test_path": dataset_source_cfg.get("test_path"),
@@ -9338,6 +9790,11 @@ def run_experiment(experiment_config_path: Path, compact_summary: bool | None = 
             "threshold_selection_split": str(threshold_meta.get("threshold_selection_split", "validation")),
             "threshold_applied_to": str(threshold_meta.get("threshold_applied_to", "none")),
             "selected_thresholds": threshold_meta.get("selected_thresholds", {}),
+            "stage2_decision_objective_mode": payload.get("metrics", {}).get("stage2_decision_objective_mode"),
+            "stage2_decision_requested": payload.get("metrics", {}).get("stage2_decision_requested"),
+            "stage2_decision_executed": payload.get("metrics", {}).get("stage2_decision_executed"),
+            "stage2_decision_accepted": payload.get("metrics", {}).get("stage2_decision_accepted"),
+            "stage2_decision_reject_reason": payload.get("metrics", {}).get("stage2_decision_reject_reason"),
         }
     summary["model_mechanism_audit"] = model_mechanism_audit
     summary["artifact_paths"] = _persist_runtime_artifacts(

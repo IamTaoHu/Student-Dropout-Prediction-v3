@@ -1,0 +1,195 @@
+experiment:
+  id: exp_uci_3class_two_stage_v9_3_enrolled_priority
+  mode: two_stage
+  seed: 42
+  dataset_config: configs/datasets/uci_student_presplit_parquet.yaml
+  target_formulation: three_class
+
+pipeline:
+  task_type: two_stage_multiclass
+  final_classes: [dropout, enrolled, graduate]
+
+target:
+  class_order: [Dropout, Enrolled, Graduate]
+
+target_mapping_override:
+  three_class:
+    Dropout: 0
+    Enrolled: 1
+    Graduate: 2
+
+splits:
+  test_size: 0.20
+  validation_size: 0.20
+  stratify_column: target
+
+preprocessing:
+  drop_missing_rows: true
+  missing_values:
+    drop_rows: true
+  imputation: median_mode
+  encoding: onehot
+  scaling: standard
+  require_onehot_encoding: true
+  outlier:
+    enabled: true
+    method: isolation_forest
+  balancing:
+    enabled: true
+    method: smote
+
+feature_engineering:
+  dataset_features:
+    derive_safe_features: true
+
+models:
+  candidates:
+    - gradient_boosting
+    - xgboost
+    - lightgbm
+    - catboost
+  tuning:
+    backend: optuna
+    n_trials: 8
+    cv_folds: 3
+    scoring: macro_f1
+    objective_source: validation
+    objective_metric: macro_f1
+    per_model_n_trials:
+      gradient_boosting: 6
+      xgboost: 8
+      lightgbm: 8
+      catboost: 8
+  retrain_on_full_train_split: true
+
+evaluation:
+  metrics:
+    - accuracy
+    - macro_f1
+    - weighted_f1
+    - balanced_accuracy
+    - macro_precision
+    - macro_recall
+  compare_default_argmax: true
+  decision_rule: model_predict
+  save_confusion_matrix: true
+  save_classification_report: true
+  cross_validation:
+    enabled: true
+    n_splits: 5
+    shuffle: true
+    random_state: 42
+
+selection:
+  primary: macro_f1
+  tie_breakers:
+    - balanced_accuracy
+    - accuracy
+
+metrics:
+  primary: macro_f1
+  secondary:
+    - accuracy
+    - weighted_f1
+    - balanced_accuracy
+    - macro_precision
+    - macro_recall
+
+two_stage:
+  enabled: true
+
+  stage1:
+    name: dropout_vs_non_dropout
+    positive_class: dropout
+    negative_group: [enrolled, graduate]
+    threshold_mode: fixed
+    dropout_threshold: 0.55
+    stage1_dropout_threshold_low: 0.30
+    stage1_dropout_threshold_high: 0.55
+    class_weight_mode: balanced
+
+  stage2:
+    name: enrolled_vs_graduate
+    classes: [enrolled, graduate]
+    class_weight_mode: custom
+    class_weight_map:
+      enrolled: 1.0
+      graduate: 1.0
+    feature_sharpening:
+      enabled: false
+    selective_interactions:
+      enabled: true
+      feature_allowlist:
+        - sem1_approval_rate
+        - sem2_approval_rate
+        - approval_rate_delta
+        - grade_delta
+    robust_prototypes:
+      enabled: false
+      add_distance_features: false
+      add_ratio_features: false
+      add_margin_feature: false
+      add_cosine_similarity: false
+      eps: 1.0e-8
+      on_failure: disable_and_continue
+    finite_sanitation:
+      enabled: true
+      replace_inf: true
+      impute_missing: true
+      fail_if_non_finite_after_impute: true
+      strategy: median
+    decision_policy:
+      enabled: true
+      mode: enrolled_priority
+      strategy: enrolled_guarded_threshold
+      use_calibrated_proba: true
+      calibration_method: temperature_scaling
+      tune_on_validation: true
+      log_selection: true
+      anti_overfit:
+        strategy: stage2_train_inner_split
+        tuning_size: 0.25
+        min_tuning_samples: 24
+        random_state: 42
+      search:
+        method: grid
+        enrolled_probability_threshold:
+          min: 0.34
+          max: 0.50
+          step: 0.02
+        graduate_margin_guard:
+          min: 0.00
+          max: 0.04
+          step: 0.02
+        enrolled_margin:
+          min: 0.00
+          max: 0.04
+          step: 0.02
+      objective:
+        metric: custom
+        name: enrolled_priority
+        mode: enrolled_priority
+        alpha_enrolled_f1: 1.0
+        beta_graduate_drop_penalty: 0.25
+        gamma_macro_f1: 0.25
+        enrolled_f1_floor: 0.50
+        graduate_f1_tolerance_vs_baseline: 0.02
+      acceptance:
+        metric: enrolled_priority_guarded
+        macro_f1_improvement_epsilon: 0.0001
+        min_enrolled_f1_gain: 0.005
+        graduate_f1_tolerance_vs_baseline: 0.02
+        max_final_macro_f1_drop: 0.003
+
+  final_decision:
+    mode: soft_fusion_with_middle_band
+    middle_band_enabled: true
+    middle_band_behavior: force_stage2_soft_fusion
+
+  stage2_positive_class: enrolled
+
+outputs:
+  results_dir: results/exp_uci_3class_two_stage_v9_3_enrolled_priority
+  runtime_artifact_format: csv
+  mirror_benchmark_outputs_to_runtime: true
+  save_artifact_manifest: true
