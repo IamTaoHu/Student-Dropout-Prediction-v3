@@ -956,6 +956,92 @@ def _resolve_decision_rule_config(
         strategy_params["dropout_threshold"] = dropout_threshold
         strategy_params["graduate_threshold"] = graduate_threshold
 
+        class_label_to_index = (
+            class_metadata.get("class_label_to_index", {})
+            if isinstance(class_metadata, dict) and isinstance(class_metadata.get("class_label_to_index", {}), dict)
+            else {}
+        )
+        canonical_label_lookup = {str(key).strip().lower(): int(value) for key, value in class_label_to_index.items()}
+
+        def _resolve_named_label(raw_value: Any, *, field_name: str, default_index: int) -> int:
+            if raw_value is None:
+                return int(default_index)
+            token = str(raw_value).strip()
+            if not token:
+                return int(default_index)
+            if token.lstrip("-").isdigit():
+                return int(token)
+            resolved = canonical_label_lookup.get(token.lower())
+            if resolved is None:
+                raise ValueError(
+                    f"inference.multiclass_decision.enrolled_decision_tuning.{field_name} "
+                    f"must match a mapped class label or class index (got {raw_value!r})."
+                )
+            return int(resolved)
+
+        tuning_raw = multiclass_decision_cfg.get("enrolled_decision_tuning", {})
+        if not isinstance(tuning_raw, dict):
+            tuning_raw = {}
+        tuning_enabled = bool(tuning_raw.get("enabled", False))
+        tuning_payload: dict[str, Any] = {"enabled": tuning_enabled}
+        if tuning_enabled:
+            enrolled_label = _resolve_named_label(
+                tuning_raw.get("enrolled_label", "Enrolled"),
+                field_name="enrolled_label",
+                default_index=1,
+            )
+            dropout_label = _resolve_named_label(
+                tuning_raw.get("dropout_label", "Dropout"),
+                field_name="dropout_label",
+                default_index=0,
+            )
+            graduate_label = _resolve_named_label(
+                tuning_raw.get("graduate_label", "Graduate"),
+                field_name="graduate_label",
+                default_index=2,
+            )
+            if len({enrolled_label, dropout_label, graduate_label}) != 3:
+                raise ValueError(
+                    "inference.multiclass_decision.enrolled_decision_tuning labels must resolve to three distinct classes."
+                )
+
+            enrolled_min_proba = float(tuning_raw.get("enrolled_min_proba", 0.30))
+            enrolled_margin_gap = float(tuning_raw.get("enrolled_margin_gap", 0.08))
+            ambiguity_max_gap = float(tuning_raw.get("ambiguity_max_gap", 0.12))
+            high_confidence_guard = float(tuning_raw.get("high_confidence_guard", 0.62))
+            graduate_guard_max = float(tuning_raw.get("graduate_guard_max", 0.62))
+            dropout_guard_max = float(tuning_raw.get("dropout_guard_max", 0.62))
+
+            for field_name, value in [
+                ("enrolled_min_proba", enrolled_min_proba),
+                ("enrolled_margin_gap", enrolled_margin_gap),
+                ("ambiguity_max_gap", ambiguity_max_gap),
+                ("high_confidence_guard", high_confidence_guard),
+                ("graduate_guard_max", graduate_guard_max),
+                ("dropout_guard_max", dropout_guard_max),
+            ]:
+                if value < 0.0 or value > 1.0:
+                    raise ValueError(
+                        f"inference.multiclass_decision.enrolled_decision_tuning.{field_name} must be within [0.0, 1.0]."
+                    )
+
+            tuning_payload.update(
+                {
+                    "enabled": True,
+                    "enrolled_label": int(enrolled_label),
+                    "dropout_label": int(dropout_label),
+                    "graduate_label": int(graduate_label),
+                    "enrolled_min_proba": float(enrolled_min_proba),
+                    "enrolled_margin_gap": float(enrolled_margin_gap),
+                    "ambiguity_max_gap": float(ambiguity_max_gap),
+                    "high_confidence_guard": float(high_confidence_guard),
+                    "graduate_guard_max": float(graduate_guard_max),
+                    "dropout_guard_max": float(dropout_guard_max),
+                    "require_enrolled_above_baseline": bool(tuning_raw.get("require_enrolled_above_baseline", True)),
+                }
+            )
+        strategy_params["enrolled_decision_tuning"] = tuning_payload
+
     if requested_rule == "enrolled_push":
         if formulation != "three_class":
             raise ValueError(

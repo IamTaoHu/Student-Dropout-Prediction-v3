@@ -235,6 +235,56 @@ class TrainEvalArgmaxTests(unittest.TestCase):
 
     @patch("src.models.train_eval.get_default_model_params", return_value={})
     @patch("src.models.train_eval.build_model", return_value=_AmbiguousThreeClassClassifier())
+    def test_enrolled_middle_band_guarded_tuning_only_promotes_guarded_middle_cases(
+        self,
+        _mock_build: object,
+        _mock_defaults: object,
+    ) -> None:
+        X_train = pd.DataFrame({"x": [0.1, 0.2, 0.3, 0.4, 0.5, 0.6]})
+        y_train = pd.Series([0, 1, 2, 0, 1, 2])
+        X_test = pd.DataFrame({"x": [0.7, 0.8, 0.9]})
+        y_test = pd.Series([1, 2, 0])
+
+        result = train_and_evaluate(
+            model_name="decision_tree",
+            params={},
+            X_train=X_train,
+            y_train=y_train,
+            X_valid=pd.DataFrame(columns=["x"]),
+            y_valid=pd.Series(dtype=int),
+            X_test=X_test,
+            y_test=y_test,
+            eval_config={
+                "seed": 42,
+                "label_order": [0, 1, 2],
+                "decision_rule": "enrolled_middle_band",
+                "multiclass_decision": {
+                    "strategy": "enrolled_middle_band",
+                    "dropout_threshold": 0.55,
+                    "graduate_threshold": 0.55,
+                    "enrolled_decision_tuning": {
+                        "enabled": True,
+                        "enrolled_label": 1,
+                        "dropout_label": 0,
+                        "graduate_label": 2,
+                        "enrolled_min_proba": 0.30,
+                        "enrolled_margin_gap": 0.12,
+                        "ambiguity_max_gap": 0.12,
+                        "graduate_guard_max": 0.62,
+                        "dropout_guard_max": 0.62,
+                        "require_enrolled_above_baseline": True,
+                    },
+                },
+                "class_weight": {"enabled": False},
+            },
+        )
+
+        self.assertListEqual(result.artifacts["y_pred_test"], [1, 2, 0])
+        self.assertEqual(int(result.artifacts["decision_rule_audit_test"]["override_count"]), 1)
+        self.assertEqual(int(result.artifacts["decision_rule_audit_test"]["enrolled_override_count"]), 1)
+
+    @patch("src.models.train_eval.get_default_model_params", return_value={})
+    @patch("src.models.train_eval.build_model", return_value=_AmbiguousThreeClassClassifier())
     def test_enrolled_push_applies_threshold_then_middle_band(
         self,
         _mock_build: object,

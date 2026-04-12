@@ -28,6 +28,14 @@ ACADEMIC_COLUMN_ALIASES: dict[str, list[str]] = {
     "grade_2nd_sem": ["grade_2nd_sem", "curricular_units_2nd_sem_grade"],
 }
 
+DEFAULT_ENROLLED_FEATURE_GROUPS: tuple[str, ...] = (
+    "efficiency",
+    "gap",
+    "trend",
+    "consistency",
+    "near_graduate",
+)
+
 
 def _first_existing(columns: list[str], candidates: list[str]) -> str | None:
     lower_map = {col.lower(): col for col in columns}
@@ -57,6 +65,252 @@ def _safe_ratio(numerator: pd.Series, denominator: pd.Series) -> pd.Series:
     den = pd.to_numeric(denominator, errors="coerce").fillna(0.0).astype(float)
     values = np.where(den > 0, num / den, 0.0)
     return pd.Series(values, index=num.index, dtype=float)
+
+
+def _series_min(left: pd.Series, right: pd.Series) -> pd.Series:
+    return pd.concat([left, right], axis=1).min(axis=1)
+
+
+def _series_max(left: pd.Series, right: pd.Series) -> pd.Series:
+    return pd.concat([left, right], axis=1).max(axis=1)
+
+
+def _build_enrolled_feature_groups(
+    df: pd.DataFrame,
+    semester_sources: dict[str, str],
+    enrolled_cfg: dict[str, Any],
+) -> None:
+    enabled = bool(enrolled_cfg.get("enabled", False))
+    if not enabled:
+        print("[features][uci][enrolled] enabled=false")
+        return
+
+    raw_groups = enrolled_cfg.get("groups", [])
+    groups: list[str] = []
+    if isinstance(raw_groups, list):
+        for item in raw_groups:
+            group = str(item).strip().lower()
+            if group and group not in groups:
+                groups.append(group)
+    if not groups:
+        groups = list(DEFAULT_ENROLLED_FEATURE_GROUPS)
+
+    eps = float(enrolled_cfg.get("eps", 1.0e-8))
+    series: dict[str, pd.Series] = {
+        token: _numeric(df, column_name) for token, column_name in semester_sources.items()
+    }
+    created_features: list[str] = []
+    skipped_features: list[str] = []
+    built_groups: list[str] = []
+
+    def mark_group(group_name: str) -> None:
+        if group_name not in built_groups:
+            built_groups.append(group_name)
+
+    def missing(tokens: list[str]) -> list[str]:
+        return [token for token in tokens if token not in series]
+
+    def add(group_name: str, feature_name: str, build_fn: Any, required: list[str]) -> None:
+        missing_tokens = missing(required)
+        if missing_tokens:
+            skipped_features.append(f"{feature_name}:missing={','.join(missing_tokens)}")
+            return
+        if feature_name in df.columns:
+            skipped_features.append(f"{feature_name}:exists")
+            return
+        output = build_fn()
+        df[feature_name] = pd.to_numeric(output, errors="coerce").fillna(0.0).astype(float)
+        series[feature_name] = df[feature_name]
+        created_features.append(feature_name)
+        mark_group(group_name)
+
+    if "efficiency" in groups:
+        add(
+            "efficiency",
+            "sem1_approval_rate",
+            lambda: _safe_ratio(series["approved_1st_sem"], series["enrolled_1st_sem"].clip(lower=eps)),
+            ["approved_1st_sem", "enrolled_1st_sem"],
+        )
+        add(
+            "efficiency",
+            "sem2_approval_rate",
+            lambda: _safe_ratio(series["approved_2nd_sem"], series["enrolled_2nd_sem"].clip(lower=eps)),
+            ["approved_2nd_sem", "enrolled_2nd_sem"],
+        )
+        add(
+            "efficiency",
+            "overall_approval_rate",
+            lambda: _safe_ratio(
+                series["approved_1st_sem"] + series["approved_2nd_sem"],
+                (series["enrolled_1st_sem"] + series["enrolled_2nd_sem"]).clip(lower=eps),
+            ),
+            ["approved_1st_sem", "approved_2nd_sem", "enrolled_1st_sem", "enrolled_2nd_sem"],
+        )
+        add(
+            "efficiency",
+            "sem1_grade_efficiency",
+            lambda: _safe_ratio(series["grade_1st_sem"], series["approved_1st_sem"].clip(lower=eps)),
+            ["grade_1st_sem", "approved_1st_sem"],
+        )
+        add(
+            "efficiency",
+            "sem2_grade_efficiency",
+            lambda: _safe_ratio(series["grade_2nd_sem"], series["approved_2nd_sem"].clip(lower=eps)),
+            ["grade_2nd_sem", "approved_2nd_sem"],
+        )
+        add(
+            "efficiency",
+            "overall_grade_efficiency",
+            lambda: _safe_ratio(
+                series["grade_1st_sem"] + series["grade_2nd_sem"],
+                (series["approved_1st_sem"] + series["approved_2nd_sem"]).clip(lower=eps),
+            ),
+            ["grade_1st_sem", "grade_2nd_sem", "approved_1st_sem", "approved_2nd_sem"],
+        )
+        add(
+            "efficiency",
+            "evaluation_to_approval_rate",
+            lambda: _safe_ratio(
+                series["approved_1st_sem"] + series["approved_2nd_sem"],
+                (series["evaluations_1st_sem"] + series["evaluations_2nd_sem"]).clip(lower=eps),
+            ),
+            ["approved_1st_sem", "approved_2nd_sem", "evaluations_1st_sem", "evaluations_2nd_sem"],
+        )
+
+    if "gap" in groups:
+        add("gap", "sem1_gap", lambda: series["enrolled_1st_sem"] - series["approved_1st_sem"], ["enrolled_1st_sem", "approved_1st_sem"])
+        add("gap", "sem2_gap", lambda: series["enrolled_2nd_sem"] - series["approved_2nd_sem"], ["enrolled_2nd_sem", "approved_2nd_sem"])
+        add(
+            "gap",
+            "persistence_gap",
+            lambda: (series["enrolled_1st_sem"] + series["enrolled_2nd_sem"])
+            - (series["approved_1st_sem"] + series["approved_2nd_sem"]),
+            ["enrolled_1st_sem", "enrolled_2nd_sem", "approved_1st_sem", "approved_2nd_sem"],
+        )
+        add(
+            "gap",
+            "evaluation_gap",
+            lambda: (series["evaluations_1st_sem"] + series["evaluations_2nd_sem"])
+            - (series["approved_1st_sem"] + series["approved_2nd_sem"]),
+            ["evaluations_1st_sem", "evaluations_2nd_sem", "approved_1st_sem", "approved_2nd_sem"],
+        )
+        add(
+            "gap",
+            "sem1_unfinished_ratio",
+            lambda: _safe_ratio(series["sem1_gap"], series["enrolled_1st_sem"].clip(lower=eps)),
+            ["sem1_gap", "enrolled_1st_sem"],
+        )
+        add(
+            "gap",
+            "sem2_unfinished_ratio",
+            lambda: _safe_ratio(series["sem2_gap"], series["enrolled_2nd_sem"].clip(lower=eps)),
+            ["sem2_gap", "enrolled_2nd_sem"],
+        )
+        add(
+            "gap",
+            "persistence_gap_ratio",
+            lambda: _safe_ratio(
+                series["persistence_gap"],
+                (series["enrolled_1st_sem"] + series["enrolled_2nd_sem"]).clip(lower=eps),
+            ),
+            ["persistence_gap", "enrolled_1st_sem", "enrolled_2nd_sem"],
+        )
+
+    if "trend" in groups:
+        add(
+            "trend",
+            "approval_rate_delta",
+            lambda: series["sem2_approval_rate"] - series["sem1_approval_rate"],
+            ["sem2_approval_rate", "sem1_approval_rate"],
+        )
+        add("trend", "grade_delta", lambda: series["grade_2nd_sem"] - series["grade_1st_sem"], ["grade_2nd_sem", "grade_1st_sem"])
+        add(
+            "trend",
+            "grade_efficiency_delta",
+            lambda: series["sem2_grade_efficiency"] - series["sem1_grade_efficiency"],
+            ["sem2_grade_efficiency", "sem1_grade_efficiency"],
+        )
+        add("trend", "load_delta", lambda: series["enrolled_2nd_sem"] - series["enrolled_1st_sem"], ["enrolled_2nd_sem", "enrolled_1st_sem"])
+        add("trend", "completion_delta", lambda: series["approved_2nd_sem"] - series["approved_1st_sem"], ["approved_2nd_sem", "approved_1st_sem"])
+        add("trend", "gap_delta", lambda: series["sem2_gap"] - series["sem1_gap"], ["sem2_gap", "sem1_gap"])
+
+    if "consistency" in groups:
+        add(
+            "consistency",
+            "approval_consistency",
+            lambda: 1.0 - (series["sem2_approval_rate"] - series["sem1_approval_rate"]).abs().clip(upper=1.0),
+            ["sem2_approval_rate", "sem1_approval_rate"],
+        )
+        add(
+            "consistency",
+            "grade_consistency",
+            lambda: 1.0
+            - _safe_ratio(
+                (series["grade_2nd_sem"] - series["grade_1st_sem"]).abs(),
+                (series["grade_1st_sem"].abs() + series["grade_2nd_sem"].abs()).clip(lower=eps),
+            ).clip(upper=1.0),
+            ["grade_2nd_sem", "grade_1st_sem"],
+        )
+        add(
+            "consistency",
+            "workload_balance",
+            lambda: _safe_ratio(
+                _series_min(series["enrolled_1st_sem"], series["enrolled_2nd_sem"]),
+                _series_max(series["enrolled_1st_sem"], series["enrolled_2nd_sem"]).clip(lower=eps),
+            ),
+            ["enrolled_1st_sem", "enrolled_2nd_sem"],
+        )
+        add(
+            "consistency",
+            "completion_balance",
+            lambda: _safe_ratio(
+                _series_min(series["approved_1st_sem"], series["approved_2nd_sem"]),
+                _series_max(series["approved_1st_sem"], series["approved_2nd_sem"]).clip(lower=eps),
+            ),
+            ["approved_1st_sem", "approved_2nd_sem"],
+        )
+        add(
+            "consistency",
+            "gap_balance",
+            lambda: _safe_ratio(
+                _series_min(series["sem1_gap"].abs(), series["sem2_gap"].abs()),
+                _series_max(series["sem1_gap"].abs(), series["sem2_gap"].abs()).clip(lower=eps),
+            ),
+            ["sem1_gap", "sem2_gap"],
+        )
+
+    if "near_graduate" in groups:
+        add(
+            "near_graduate",
+            "sem2_completion_strength",
+            lambda: series["sem2_approval_rate"] * series["sem2_grade_efficiency"],
+            ["sem2_approval_rate", "sem2_grade_efficiency"],
+        )
+        add(
+            "near_graduate",
+            "overall_completion_strength",
+            lambda: series["overall_approval_rate"] * series["overall_grade_efficiency"],
+            ["overall_approval_rate", "overall_grade_efficiency"],
+        )
+        add(
+            "near_graduate",
+            "completion_strength_delta",
+            lambda: series["sem2_completion_strength"] - (series["sem1_approval_rate"] * series["sem1_grade_efficiency"]),
+            ["sem2_completion_strength", "sem1_approval_rate", "sem1_grade_efficiency"],
+        )
+        add(
+            "near_graduate",
+            "near_graduate_gap_signal",
+            lambda: series["overall_completion_strength"] - series["persistence_gap_ratio"],
+            ["overall_completion_strength", "persistence_gap_ratio"],
+        )
+
+    skipped_preview = skipped_features[:8]
+    print(
+        "[features][uci][enrolled] "
+        f"enabled=true groups={groups} built_groups={built_groups or ['none']} "
+        f"added_columns={len(created_features)} skipped={skipped_preview}"
+    )
 
 
 def _add_if_sources(
@@ -318,6 +572,13 @@ def build_uct_student_features(adapted: dict[str, Any] | pd.DataFrame, feature_c
                 + _numeric(df, semester_sources["evaluations_2nd_sem"]),
             ),
         )
+
+        enrolled_feature_groups_cfg = (
+            feature_config.get("enrolled_feature_groups", {})
+            if isinstance(feature_config.get("enrolled_feature_groups", {}), dict)
+            else {}
+        )
+        _build_enrolled_feature_groups(df, semester_sources, enrolled_feature_groups_cfg)
 
     derive_enrolled_focus_features = bool(feature_config.get("derive_enrolled_focus_features", False))
     if derive_enrolled_focus_features:

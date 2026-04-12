@@ -235,6 +235,45 @@ def _predict_labels_with_rule(
     return y_pred.astype(int), y_proba
 
 
+def _build_decision_rule_audit(
+    *,
+    y_pred: np.ndarray,
+    y_proba: np.ndarray | None,
+    labels: list[int] | tuple[int, ...] | np.ndarray,
+    decision_rule: str,
+    multiclass_decision_config: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    strategy = str(decision_rule or "model_predict").strip().lower()
+    cfg = multiclass_decision_config if isinstance(multiclass_decision_config, dict) else {}
+    labels_arr = np.asarray(labels, dtype=int)
+    audit: dict[str, Any] = {
+        "decision_rule": strategy,
+        "probabilities_available": bool(y_proba is not None),
+        "fallback_to_native_prediction": bool(strategy != "model_predict" and y_proba is None),
+        "override_count": 0,
+        "enrolled_override_count": 0,
+    }
+    if y_proba is None or strategy in {"model_predict"}:
+        return audit
+
+    probs = np.asarray(y_proba, dtype=float)
+    if probs.ndim != 2 or probs.shape[1] != labels_arr.size:
+        audit["fallback_to_native_prediction"] = True
+        audit["reason"] = "invalid_probability_shape"
+        return audit
+
+    argmax_pred = labels_arr[np.argmax(probs, axis=1)].astype(int)
+    pred_arr = np.asarray(y_pred, dtype=int)
+    override_mask = pred_arr != argmax_pred
+    audit["override_count"] = int(np.sum(override_mask))
+    enrolled_label = int(cfg.get("enrolled_label", 1))
+    tuning_cfg = cfg.get("enrolled_decision_tuning", {}) if isinstance(cfg.get("enrolled_decision_tuning", {}), dict) else {}
+    if isinstance(tuning_cfg, dict) and tuning_cfg:
+        enrolled_label = int(tuning_cfg.get("enrolled_label", enrolled_label))
+    audit["enrolled_override_count"] = int(np.sum(override_mask & (pred_arr == enrolled_label)))
+    return audit
+
+
 def multiclass_predictions_from_probabilities(
     y_proba: np.ndarray,
     labels: list[int] | tuple[int, ...] | np.ndarray,
@@ -296,6 +335,42 @@ def multiclass_predictions_from_probabilities(
         return pred.astype(int)
 
     if normalized_strategy == "enrolled_middle_band":
+        tuning_cfg = cfg.get("enrolled_decision_tuning", {}) if isinstance(cfg.get("enrolled_decision_tuning", {}), dict) else {}
+        tuning_enabled = bool(tuning_cfg.get("enabled", False))
+        if tuning_enabled:
+            enrolled_label = int(tuning_cfg.get("enrolled_label", enrolled_label))
+            dropout_label = int(tuning_cfg.get("dropout_label", dropout_label))
+            graduate_label = int(tuning_cfg.get("graduate_label", graduate_label))
+            dropout_col = class_to_col[dropout_label]
+            enrolled_col = class_to_col[enrolled_label]
+            graduate_col = class_to_col[graduate_label]
+
+            p_dropout = probs[:, dropout_col]
+            p_enrolled = probs[:, enrolled_col]
+            p_graduate = probs[:, graduate_col]
+            top_competitor = np.maximum(p_dropout, p_graduate)
+            top2 = np.partition(probs, -2, axis=1)[:, -2]
+            top1 = np.max(probs, axis=1)
+            top1_minus_top2 = top1 - top2
+
+            enrolled_min_proba = float(tuning_cfg.get("enrolled_min_proba", 0.30))
+            enrolled_margin_gap = float(tuning_cfg.get("enrolled_margin_gap", 0.08))
+            ambiguity_max_gap = float(tuning_cfg.get("ambiguity_max_gap", 0.12))
+            high_confidence_guard = float(tuning_cfg.get("high_confidence_guard", 0.62))
+            graduate_guard_max = float(tuning_cfg.get("graduate_guard_max", 0.62))
+            dropout_guard_max = float(tuning_cfg.get("dropout_guard_max", 0.62))
+            require_enrolled_above_baseline = bool(tuning_cfg.get("require_enrolled_above_baseline", True))
+
+            pred = argmax_pred.copy()
+            enrolled_min_mask = p_enrolled >= enrolled_min_proba
+            competitor_margin_mask = p_enrolled >= (top_competitor - enrolled_margin_gap)
+            ambiguity_mask = (top_competitor <= high_confidence_guard) | (top1_minus_top2 <= ambiguity_max_gap)
+            guard_mask = (p_graduate <= graduate_guard_max) & (p_dropout <= dropout_guard_max)
+            baseline_mask = (pred != enrolled_label) if require_enrolled_above_baseline else np.ones(probs.shape[0], dtype=bool)
+            override_mask = baseline_mask & enrolled_min_mask & competitor_margin_mask & ambiguity_mask & guard_mask
+            pred[override_mask] = enrolled_label
+            return pred.astype(int)
+
         dropout_threshold_raw = cfg.get("dropout_threshold", None)
         graduate_threshold_raw = cfg.get("graduate_threshold", None)
         if dropout_threshold_raw is None or graduate_threshold_raw is None:
@@ -1347,7 +1422,31 @@ def train_and_evaluate(
         "decision_rule": decision_rule,
         "multiclass_decision": multiclass_decision_cfg if isinstance(multiclass_decision_cfg, dict) else {},
         "decision_rule_applied_on_probabilities": bool(decision_rule != "model_predict" and y_proba_test is not None),
+        "decision_rule_audit_valid": _build_decision_rule_audit(
+            y_pred=y_pred_valid,
+            y_proba=y_proba_valid,
+            labels=labels,
+            decision_rule=decision_rule,
+            multiclass_decision_config=multiclass_decision_cfg,
+        )
+        if not X_valid.empty
+        else {},
+        "decision_rule_audit_test": _build_decision_rule_audit(
+            y_pred=y_pred_test,
+            y_proba=y_proba_test,
+            labels=labels,
+            decision_rule=decision_rule,
+            multiclass_decision_config=multiclass_decision_cfg,
+        ),
     }
+    test_decision_audit = artifacts.get("decision_rule_audit_test", {})
+    print(
+        "[decision_rule][test] "
+        f"strategy={decision_rule} "
+        f"fallback={bool(test_decision_audit.get('fallback_to_native_prediction', False))} "
+        f"overrides={int(test_decision_audit.get('override_count', 0))} "
+        f"enrolled_overrides={int(test_decision_audit.get('enrolled_override_count', 0))}"
+    )
     return TrainEvalResult(metrics=metrics, artifacts=artifacts)
 
 
@@ -1470,5 +1569,20 @@ def retrain_on_full_train_and_evaluate_test(
         "decision_rule": decision_rule,
         "multiclass_decision": multiclass_decision_cfg if isinstance(multiclass_decision_cfg, dict) else {},
         "decision_rule_applied_on_probabilities": bool(decision_rule != "model_predict" and y_proba_test is not None),
+        "decision_rule_audit_test": _build_decision_rule_audit(
+            y_pred=y_pred_test,
+            y_proba=y_proba_test,
+            labels=labels,
+            decision_rule=decision_rule,
+            multiclass_decision_config=multiclass_decision_cfg,
+        ),
     }
+    test_decision_audit = artifacts.get("decision_rule_audit_test", {})
+    print(
+        "[decision_rule][test] "
+        f"strategy={decision_rule} "
+        f"fallback={bool(test_decision_audit.get('fallback_to_native_prediction', False))} "
+        f"overrides={int(test_decision_audit.get('override_count', 0))} "
+        f"enrolled_overrides={int(test_decision_audit.get('enrolled_override_count', 0))}"
+    )
     return TrainEvalResult(metrics=metrics, artifacts=artifacts)

@@ -128,6 +128,44 @@ class DecisionPolicyConfigTests(unittest.TestCase):
         self.assertTrue(bool(resolved["multiclass_decision"]["auto_tune"]["enabled"]))
         self.assertEqual(resolved["multiclass_decision"]["auto_tune"]["search"]["method"], "grid")
 
+    def test_enrolled_middle_band_guarded_tuning_resolves_named_labels(self) -> None:
+        cfg = {
+            "inference": {
+                "multiclass_decision": {
+                    "strategy": "enrolled_middle_band",
+                    "dropout_threshold": 0.55,
+                    "graduate_threshold": 0.55,
+                    "enrolled_decision_tuning": {
+                        "enabled": True,
+                        "enrolled_label": "Enrolled",
+                        "dropout_label": "Dropout",
+                        "graduate_label": "Graduate",
+                        "enrolled_min_proba": 0.30,
+                        "enrolled_margin_gap": 0.08,
+                        "ambiguity_max_gap": 0.12,
+                        "graduate_guard_max": 0.62,
+                        "dropout_guard_max": 0.62,
+                        "require_enrolled_above_baseline": True,
+                    },
+                }
+            }
+        }
+        resolved = _resolve_decision_rule_config(
+            exp_cfg=cfg,
+            formulation="three_class",
+            two_stage_enabled=False,
+            class_metadata={
+                "class_indices": [0, 1, 2],
+                "class_label_to_index": {"Dropout": 0, "Enrolled": 1, "Graduate": 2},
+            },
+        )
+        tuning = resolved["multiclass_decision"]["enrolled_decision_tuning"]
+        self.assertTrue(bool(tuning["enabled"]))
+        self.assertEqual(int(tuning["enrolled_label"]), 1)
+        self.assertEqual(int(tuning["dropout_label"]), 0)
+        self.assertEqual(int(tuning["graduate_label"]), 2)
+        self.assertAlmostEqual(float(tuning["enrolled_margin_gap"]), 0.08)
+
     def test_enrolled_push_config_with_threshold_and_middle_band_resolves(self) -> None:
         cfg = {
             "inference": {

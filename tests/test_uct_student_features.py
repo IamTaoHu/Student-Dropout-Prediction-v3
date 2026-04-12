@@ -135,6 +135,71 @@ class UctStudentFeatureBuilderTests(unittest.TestCase):
         self.assertAlmostEqual(float(out.loc[0, "sem1_to_sem2_approval_stability"]), 4.0 / 5.0, places=6)
         self.assertEqual(float(out.loc[0, "academic_momentum"]), 1.0)
 
+    def test_enrolled_feature_groups_build_compact_pack_and_skip_missing_optional_dependencies(self) -> None:
+        df = pd.DataFrame(
+            {
+                "__row_id__": [0, 1],
+                "target": ["Enrolled", "Graduate"],
+                "approved_1st_sem": [4, 8],
+                "approved_2nd_sem": [5, 9],
+                "enrolled_1st_sem": [6, 10],
+                "enrolled_2nd_sem": [7, 10],
+                "grade_1st_sem": [12.0, 14.0],
+                "grade_2nd_sem": [13.0, 15.0],
+            }
+        )
+        adapted = {"data": df, "id_column": "__row_id__", "target_column": "target"}
+        out = build_uct_student_features(
+            adapted,
+            {
+                "derive_safe_features": True,
+                "enrolled_feature_groups": {
+                    "enabled": True,
+                    "groups": ["efficiency", "gap", "trend", "consistency", "near_graduate"],
+                },
+            },
+        )
+
+        expected_cols = {
+            "sem1_approval_rate",
+            "sem2_approval_rate",
+            "overall_approval_rate",
+            "sem1_grade_efficiency",
+            "sem2_grade_efficiency",
+            "overall_grade_efficiency",
+            "sem1_gap",
+            "sem2_gap",
+            "persistence_gap",
+            "sem1_unfinished_ratio",
+            "sem2_unfinished_ratio",
+            "persistence_gap_ratio",
+            "approval_rate_delta",
+            "grade_delta",
+            "grade_efficiency_delta",
+            "load_delta",
+            "completion_delta",
+            "gap_delta",
+            "approval_consistency",
+            "grade_consistency",
+            "workload_balance",
+            "completion_balance",
+            "gap_balance",
+            "sem2_completion_strength",
+            "overall_completion_strength",
+            "completion_strength_delta",
+            "near_graduate_gap_signal",
+        }
+        self.assertTrue(expected_cols.issubset(set(out.columns)))
+        self.assertNotIn("evaluation_to_approval_rate", out.columns)
+        self.assertNotIn("evaluation_gap", out.columns)
+        self.assertAlmostEqual(float(out.loc[0, "sem1_approval_rate"]), 4.0 / 6.0, places=6)
+        self.assertAlmostEqual(float(out.loc[0, "sem2_approval_rate"]), 5.0 / 7.0, places=6)
+        self.assertAlmostEqual(float(out.loc[0, "sem1_gap"]), 2.0, places=6)
+        self.assertAlmostEqual(float(out.loc[0, "persistence_gap_ratio"]), 4.0 / 13.0, places=6)
+        self.assertAlmostEqual(float(out.loc[0, "grade_efficiency_delta"]), (13.0 / 5.0) - (12.0 / 4.0), places=6)
+        self.assertAlmostEqual(float(out.loc[0, "completion_balance"]), 4.0 / 5.0, places=6)
+        self.assertAlmostEqual(float(out.loc[0, "near_graduate_gap_signal"]), (9.0 / 13.0) * (25.0 / 9.0) - (4.0 / 13.0), places=6)
+
     def test_derived_columns_are_not_target_dependent(self) -> None:
         base = pd.DataFrame(
             {

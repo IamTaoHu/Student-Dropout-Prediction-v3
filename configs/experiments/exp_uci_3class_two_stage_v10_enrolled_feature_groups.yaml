@@ -1,0 +1,112 @@
+# UCI 3-class benchmark with compact enrolled-focused semester feature groups.
+experiment:
+  id: exp_uci_3class_two_stage_v10_enrolled_feature_groups
+  seed: 42
+  dataset_config: configs/datasets/uci_student_presplit_parquet.yaml
+  target_formulation: three_class
+
+target:
+  class_order: [Dropout, Enrolled, Graduate]
+
+target_mapping_override:
+  three_class:
+    Dropout: 0
+    Enrolled: 1
+    Graduate: 2
+
+splits:
+  test_size: 0.20
+  validation_size: 0.20
+  stratify_column: target
+
+preprocessing:
+  drop_missing_rows: true
+  missing_values:
+    drop_rows: true
+  imputation: median_mode
+  encoding: onehot
+  scaling: standard
+  require_onehot_encoding: true
+  outlier:
+    enabled: true
+    method: isolation_forest
+  balancing:
+    enabled: true
+    method: smote
+
+feature_engineering:
+  dataset_features:
+    derive_safe_features: true
+    enrolled_feature_groups:
+      enabled: true
+      groups:
+        - efficiency
+        - gap
+        - trend
+        - consistency
+        - near_graduate
+      eps: 1.0e-8
+
+models:
+  candidates:
+    - svm
+    - random_forest
+    - gradient_boosting
+    - xgboost
+    - lightgbm
+    - catboost
+  tuning:
+    backend: optuna
+    n_trials: 8
+    cv_folds: 3
+    scoring: macro_f1
+    objective_source: validation
+    objective_metric: macro_f1
+    per_model_n_trials:
+      logistic_regression: 6
+      svm: 6
+      random_forest: 8
+      gradient_boosting: 6
+      xgboost: 8
+      lightgbm: 8
+      catboost: 8
+  retrain_on_full_train_split: true
+
+evaluation:
+  metrics:
+    - accuracy
+    - macro_f1
+    - weighted_f1
+    - balanced_accuracy
+    - macro_precision
+    - macro_recall
+  compare_default_argmax: true
+  decision_rule: model_predict
+  save_confusion_matrix: true
+  save_classification_report: true
+  cross_validation:
+    enabled: true
+    n_splits: 5
+    shuffle: true
+    random_state: 42
+
+selection:
+  primary: macro_f1
+  tie_breakers:
+    - balanced_accuracy
+    - accuracy
+
+metrics:
+  primary: macro_f1
+  secondary:
+    - accuracy
+    - weighted_f1
+    - balanced_accuracy
+    - macro_precision
+    - macro_recall
+
+outputs:
+  results_dir: results/exp_uci_3class_two_stage_v10_enrolled_feature_groups
+  runtime_artifact_format: csv
+  mirror_benchmark_outputs_to_runtime: true
+  save_artifact_manifest: true
