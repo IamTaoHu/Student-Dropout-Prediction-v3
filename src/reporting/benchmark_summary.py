@@ -212,16 +212,36 @@ def save_benchmark_summary(summary: dict[str, Any], output_dir: Path, compact: b
     with json_path.open("w", encoding="utf-8") as f:
         json.dump(persisted_summary, f, indent=2, default=_json_default)
 
-    leaderboard_path = _save_leaderboard_csv(summary, output_dir)
+    try:
+        leaderboard_path = _save_leaderboard_csv(summary, output_dir)
+    except Exception as exc:
+        print(f"[benchmark_summary][warning] failed to write leaderboard/summary csv: {type(exc).__name__}: {exc}")
+        leaderboard_path = output_dir / "leaderboard.csv"
     if leaderboard_path.exists():
         try:
             leaderboard_df = pd.read_csv(leaderboard_path)
-        except Exception:
+        except Exception as exc:
+            print(f"[benchmark_summary][warning] failed to reload leaderboard csv: {type(exc).__name__}: {exc}")
             leaderboard_df = pd.DataFrame()
     else:
         leaderboard_df = pd.DataFrame()
-    _save_markdown_summary(summary, leaderboard_df, output_dir)
-    _save_confusion_matrix_plots(summary, output_dir)
-    _save_normalized_confusion_matrix_plots(summary, output_dir)
-    _save_classification_reports(summary, output_dir)
+    try:
+        _save_markdown_summary(summary, leaderboard_df, output_dir)
+    except Exception as exc:
+        print(f"[benchmark_summary][warning] failed to write markdown summary: {type(exc).__name__}: {exc}")
+    try:
+        _save_confusion_matrix_plots(summary, output_dir)
+    except Exception as exc:
+        print(f"[benchmark_summary][warning] failed to write confusion matrix plots: {type(exc).__name__}: {exc}")
+    try:
+        _save_normalized_confusion_matrix_plots(summary, output_dir)
+    except Exception as exc:
+        print(
+            "[benchmark_summary][warning] "
+            f"failed to write normalized confusion matrix plots: {type(exc).__name__}: {exc}"
+        )
+    try:
+        _save_classification_reports(summary, output_dir)
+    except Exception as exc:
+        print(f"[benchmark_summary][warning] failed to write classification reports: {type(exc).__name__}: {exc}")
     return json_path

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import re
 from typing import Any
 
 import numpy as np
@@ -34,6 +35,96 @@ class TrainEvalResult:
 
     metrics: dict[str, float]
     artifacts: dict[str, Any]
+
+
+def _sanitize_lightgbm_feature_name(name: Any) -> str:
+    text = str(name).strip()
+    sanitized = re.sub(r"[^0-9A-Za-z_]+", "_", text)
+    sanitized = re.sub(r"_+", "_", sanitized).strip("_")
+    return sanitized or "feature"
+
+
+def _prepare_lightgbm_feature_frames(
+    *,
+    model_name: str,
+    frames: dict[str, pd.DataFrame],
+    emit_log: bool = False,
+    context: str = "fit",
+) -> tuple[dict[str, pd.DataFrame], dict[str, Any]]:
+    if model_name != "lightgbm":
+        return frames, {
+            "applied": False,
+            "model": model_name,
+            "context": context,
+            "column_count": int(len(next(iter(frames.values())).columns)) if frames else 0,
+            "sanitized": False,
+            "duplicates_disambiguated": 0,
+            "mapping": {},
+        }
+    if not frames:
+        return frames, {
+            "applied": False,
+            "model": model_name,
+            "context": context,
+            "column_count": 0,
+            "sanitized": False,
+            "duplicates_disambiguated": 0,
+            "mapping": {},
+        }
+
+    reference_name, reference_df = next(iter(frames.items()))
+    reference_columns = [str(col) for col in reference_df.columns]
+    sanitized_columns: list[str] = []
+    mapping: dict[str, str] = {}
+    used: dict[str, int] = {}
+    sanitized_count = 0
+    duplicate_count = 0
+
+    for original in reference_columns:
+        base = _sanitize_lightgbm_feature_name(original)
+        if base != original:
+            sanitized_count += 1
+        candidate = base
+        suffix = 1
+        while candidate in used:
+            suffix += 1
+            candidate = f"{base}_{suffix}"
+        if candidate != base:
+            duplicate_count += 1
+        used[candidate] = 1
+        mapping[original] = candidate
+        sanitized_columns.append(candidate)
+
+    sanitized_frames: dict[str, pd.DataFrame] = {}
+    for frame_name, frame in frames.items():
+        if list(frame.columns) != list(reference_df.columns):
+            raise ValueError(
+                "LightGBM feature-name sanitization requires aligned feature schemas across frames. "
+                f"context={context} reference={reference_name} frame={frame_name}"
+            )
+        renamed = frame.copy()
+        renamed.columns = sanitized_columns
+        sanitized_frames[frame_name] = renamed
+
+    metadata = {
+        "applied": True,
+        "model": model_name,
+        "context": context,
+        "reference_frame": reference_name,
+        "column_count": int(len(reference_columns)),
+        "sanitized": bool(sanitized_count > 0 or duplicate_count > 0),
+        "sanitized_count": int(sanitized_count),
+        "duplicates_disambiguated": int(duplicate_count),
+        "mapping": mapping,
+    }
+    if emit_log:
+        print(
+            "[lightgbm][feature_names] "
+            f"context={context} column_count={len(reference_columns)} "
+            f"sanitized={bool(metadata['sanitized'])} "
+            f"duplicates_disambiguated={int(duplicate_count)}"
+        )
+    return sanitized_frames, metadata
 
 
 def run_leakage_safe_stratified_cv(
@@ -1168,12 +1259,20 @@ def tune_model_with_optuna(
         if objective_source == "validation":
             if X_valid is None or y_valid is None:
                 raise ValueError("objective_source='validation' requires X_valid and y_valid.")
+            tuned_frames, _ = _prepare_lightgbm_feature_frames(
+                model_name=model_name,
+                frames={"train": X_train, "valid": X_valid},
+                emit_log=False,
+                context="optuna_validation",
+            )
+            X_train_effective = tuned_frames["train"]
+            X_valid_effective = tuned_frames["valid"]
             effective_class_weight_cfg = class_weight_cfg if class_weight_cfg else {"enabled": use_class_weights, "strategy": "balanced"}
             if not effective_class_weight_cfg.get("enabled", False):
                 effective_class_weight_cfg = {"enabled": use_class_weights, "strategy": "balanced"}
             sample_weight, _ = _compute_sample_weight(y_train, class_weight_cfg=effective_class_weight_cfg)
-            _fit_model_with_optional_weights(model, X_train, y_train, sample_weight=sample_weight)
-            y_pred = model.predict(X_valid)
+            _fit_model_with_optional_weights(model, X_train_effective, y_train, sample_weight=sample_weight)
+            y_pred = model.predict(X_valid_effective)
             metrics = compute_metrics(y_valid, y_pred)
             per_class = compute_per_class_metrics(y_valid, y_pred, labels=sorted(pd.Series(y_valid).unique().tolist()))
             trial.set_user_attr("validation_metrics", metrics)
@@ -1306,13 +1405,22 @@ def train_and_evaluate(
     else:
         class_weight_info = {**class_weight_info, "model_param_class_weight_applied": False}
     model = build_model(model_name=model_name, params=full_params)
+    prepared_frames, lightgbm_feature_name_info = _prepare_lightgbm_feature_frames(
+        model_name=model_name,
+        frames={"train": X_train, "valid": X_valid, "test": X_test},
+        emit_log=True,
+        context="train_and_evaluate",
+    )
+    X_train_effective = prepared_frames["train"]
+    X_valid_effective = prepared_frames["valid"]
+    X_test_effective = prepared_frames["test"]
 
     sample_weight_train, sample_weight_info = _compute_sample_weight(y_train, class_weight_cfg=class_weight_cfg)
     if not sample_weight_supported:
         sample_weight_train = None
     sample_weight_applied = _fit_model_with_optional_weights(
         model,
-        X_train,
+        X_train_effective,
         y_train,
         sample_weight=sample_weight_train,
         require_sample_weight_support=bool(class_weight_requested and class_map and not native_param_supported),
@@ -1361,17 +1469,17 @@ def train_and_evaluate(
 
     y_pred_valid = np.array([], dtype=int)
     y_proba_valid = None
-    if not X_valid.empty:
+    if not X_valid_effective.empty:
         y_pred_valid, y_proba_valid = _predict_labels_with_rule(
             model=model,
-            X=X_valid,
+            X=X_valid_effective,
             decision_rule=decision_rule,
             label_order=labels,
             multiclass_decision_config=multiclass_decision_cfg,
         )
     y_pred_test, y_proba_test = _predict_labels_with_rule(
         model=model,
-        X=X_test,
+        X=X_test_effective,
         decision_rule=decision_rule,
         label_order=labels,
         multiclass_decision_config=multiclass_decision_cfg,
@@ -1422,6 +1530,18 @@ def train_and_evaluate(
         "decision_rule": decision_rule,
         "multiclass_decision": multiclass_decision_cfg if isinstance(multiclass_decision_cfg, dict) else {},
         "decision_rule_applied_on_probabilities": bool(decision_rule != "model_predict" and y_proba_test is not None),
+        "lightgbm_feature_name_mapping": lightgbm_feature_name_info,
+        "runtime_artifact_override": (
+            {
+                "X_train": X_train_effective.copy(),
+                "X_valid": X_valid_effective.copy(),
+                "X_test": X_test_effective.copy(),
+                "feature_names": list(X_train_effective.columns),
+                "lightgbm_feature_name_mapping": lightgbm_feature_name_info,
+            }
+            if bool(lightgbm_feature_name_info.get("applied", False))
+            else None
+        ),
         "decision_rule_audit_valid": _build_decision_rule_audit(
             y_pred=y_pred_valid,
             y_proba=y_proba_valid,
@@ -1429,7 +1549,7 @@ def train_and_evaluate(
             decision_rule=decision_rule,
             multiclass_decision_config=multiclass_decision_cfg,
         )
-        if not X_valid.empty
+        if not X_valid_effective.empty
         else {},
         "decision_rule_audit_test": _build_decision_rule_audit(
             y_pred=y_pred_test,
@@ -1481,13 +1601,21 @@ def retrain_on_full_train_and_evaluate_test(
     else:
         class_weight_info = {**class_weight_info, "model_param_class_weight_applied": False}
     model = build_model(model_name=model_name, params=full_params)
+    prepared_frames, lightgbm_feature_name_info = _prepare_lightgbm_feature_frames(
+        model_name=model_name,
+        frames={"train_full": X_train_full, "test": X_test},
+        emit_log=True,
+        context="retrain_full_train",
+    )
+    X_train_full_effective = prepared_frames["train_full"]
+    X_test_effective = prepared_frames["test"]
 
     sample_weight_train, sample_weight_info = _compute_sample_weight(y_train_full, class_weight_cfg=class_weight_cfg)
     if not sample_weight_supported:
         sample_weight_train = None
     sample_weight_applied = _fit_model_with_optional_weights(
         model,
-        X_train_full,
+        X_train_full_effective,
         y_train_full,
         sample_weight=sample_weight_train,
         require_sample_weight_support=bool(class_weight_requested and class_map and not native_param_supported),
@@ -1537,7 +1665,7 @@ def retrain_on_full_train_and_evaluate_test(
 
     y_pred_test, y_proba_test = _predict_labels_with_rule(
         model=model,
-        X=X_test,
+        X=X_test_effective,
         decision_rule=decision_rule,
         label_order=labels,
         multiclass_decision_config=multiclass_decision_cfg,
@@ -1569,6 +1697,18 @@ def retrain_on_full_train_and_evaluate_test(
         "decision_rule": decision_rule,
         "multiclass_decision": multiclass_decision_cfg if isinstance(multiclass_decision_cfg, dict) else {},
         "decision_rule_applied_on_probabilities": bool(decision_rule != "model_predict" and y_proba_test is not None),
+        "lightgbm_feature_name_mapping": lightgbm_feature_name_info,
+        "runtime_artifact_override": (
+            {
+                "X_train": X_train_full_effective.copy(),
+                "X_valid": pd.DataFrame(columns=X_train_full_effective.columns),
+                "X_test": X_test_effective.copy(),
+                "feature_names": list(X_train_full_effective.columns),
+                "lightgbm_feature_name_mapping": lightgbm_feature_name_info,
+            }
+            if bool(lightgbm_feature_name_info.get("applied", False))
+            else None
+        ),
         "decision_rule_audit_test": _build_decision_rule_audit(
             y_pred=y_pred_test,
             y_proba=y_proba_test,

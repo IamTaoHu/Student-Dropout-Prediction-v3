@@ -132,6 +132,43 @@ class TrainEvalArgmaxTests(unittest.TestCase):
 
     @patch("src.models.train_eval.get_default_model_params", return_value={})
     @patch("src.models.train_eval.build_model", return_value=_DummyClassifier())
+    def test_lightgbm_feature_names_are_sanitized_and_disambiguated_consistently(
+        self,
+        _mock_build: object,
+        _mock_defaults: object,
+    ) -> None:
+        X_train = pd.DataFrame({"feat[a]": [0.1, 0.2, 0.3, 0.4], "feat(a)": [1.0, 1.1, 1.2, 1.3]})
+        y_train = pd.Series([0, 1, 2, 1])
+        X_valid = pd.DataFrame({"feat[a]": [0.5, 0.6], "feat(a)": [1.4, 1.5]})
+        y_valid = pd.Series([0, 2])
+        X_test = pd.DataFrame({"feat[a]": [0.7, 0.8], "feat(a)": [1.6, 1.7]})
+        y_test = pd.Series([0, 2])
+
+        result = train_and_evaluate(
+            model_name="lightgbm",
+            params={},
+            X_train=X_train,
+            y_train=y_train,
+            X_valid=X_valid,
+            y_valid=y_valid,
+            X_test=X_test,
+            y_test=y_test,
+            eval_config={
+                "seed": 42,
+                "label_order": [0, 1, 2],
+                "decision_rule": "argmax",
+                "class_weight": {"enabled": False},
+            },
+        )
+
+        runtime_override = result.artifacts["runtime_artifact_override"]
+        self.assertIsInstance(runtime_override, dict)
+        self.assertListEqual(list(runtime_override["X_train"].columns), ["feat_a", "feat_a_2"])
+        self.assertEqual(result.artifacts["lightgbm_feature_name_mapping"]["sanitized_count"], 2)
+        self.assertEqual(result.artifacts["lightgbm_feature_name_mapping"]["duplicates_disambiguated"], 1)
+
+    @patch("src.models.train_eval.get_default_model_params", return_value={})
+    @patch("src.models.train_eval.build_model", return_value=_DummyClassifier())
     def test_model_predict_decision_rule_keeps_native_predictions(self, _mock_build: object, _mock_defaults: object) -> None:
         X_train = pd.DataFrame({"x": [0.1, 0.2, 0.3, 0.4]})
         y_train = pd.Series([0, 1, 2, 1])

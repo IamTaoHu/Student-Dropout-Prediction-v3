@@ -37,7 +37,6 @@ def _xgboost_factory(params: dict[str, Any]) -> Any:
         raise ImportError("xgboost is not installed. Install it to use the xgboost model.") from exc
     payload = {
         "eval_metric": "mlogloss",
-        "use_label_encoder": False,
         **params,
     }
     return XGBClassifier(**payload)

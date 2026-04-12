@@ -68,7 +68,7 @@ def plot_learning_curve(
         train_sizes=np.linspace(0.2, 1.0, 5),
         cv=cv,
         scoring=scorer,
-        n_jobs=-1,
+        n_jobs=1,
         shuffle=True,
         random_state=random_state,
     )
@@ -356,7 +356,7 @@ def generate_all_figures(
     except Exception as exc:
         statuses["learning_curve"] = {
             "status": "failed",
-            "reason": f"figure_generation_error: {exc}",
+            "reason": f"learning_curve_generation_failed: {type(exc).__name__}: {exc}",
         }
 
     shap_compatible = _is_tree_model_for_shap(model)

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import argparse
 import copy
-from datetime import datetime
+from datetime import datetime, timezone
 import itertools
 import json
 from pathlib import Path
@@ -470,13 +470,30 @@ def _write_benchmark_failure_summary(
     experiment_id: str,
     requested_models: list[str],
     model_results: dict[str, Any],
+    failed_models: dict[str, str] | None = None,
+    successful_models: list[str] | None = None,
+    reason: str = "no_candidate_models_completed",
 ) -> dict[str, str]:
     output_dir.mkdir(parents=True, exist_ok=True)
+    failed_payload = failed_models if isinstance(failed_models, dict) else {}
+    successful_payload = successful_models if isinstance(successful_models, list) else []
+    status = "failed" if not successful_payload else "partial_success"
     failure_payload = {
         "experiment_id": experiment_id,
-        "status": "failed",
-        "reason": "no_candidate_models_completed",
+        "status": status,
+        "reason": reason,
         "requested_models": list(requested_models),
+        "successful_models": list(successful_payload),
+        "successful_candidate_count": int(len(successful_payload)),
+        "failed_models": {
+            str(model_name): {
+                "error": str(error_msg),
+                "exception_class": str(str(error_msg).split(":", 1)[0]).strip() if error_msg else "",
+                "message": str(str(error_msg).split(":", 1)[1]).strip() if isinstance(error_msg, str) and ":" in error_msg else str(error_msg),
+            }
+            for model_name, error_msg in failed_payload.items()
+        },
+        "failed_candidate_count": int(len(failed_payload)),
         "model_results": model_results,
     }
     json_path = output_dir / "benchmark_failure_summary.json"
@@ -486,18 +503,28 @@ def _write_benchmark_failure_summary(
         "# Benchmark Failure Summary",
         "",
         f"- Experiment ID: `{experiment_id}`",
-        "- Status: `failed`",
-        "- Reason: `no_candidate_models_completed`",
+        f"- Status: `{status}`",
+        f"- Reason: `{reason}`",
         f"- Requested models: `{requested_models}`",
+        f"- Successful models: `{successful_payload}`",
+        f"- Failed model count: `{len(failed_payload)}`",
         "",
         "## Model Failures",
         "",
     ]
     for model_name in requested_models:
-        payload = model_results.get(model_name, {})
-        error_msg = payload.get("error", "unknown_failure") if isinstance(payload, dict) else "unknown_failure"
+        if model_name not in failed_payload:
+            continue
+        error_msg = failed_payload.get(model_name, "unknown_failure")
         lines.append(f"- `{model_name}`: `{error_msg}`")
     md_path.write_text("\n".join(lines), encoding="utf-8")
+    print(
+        "[finalization][failure_summary] "
+        f"status={status} reason={reason} "
+        f"successful_candidates={len(successful_payload)} "
+        f"failed_candidates={len(failed_payload)} "
+        f"path={json_path}"
+    )
     return {
         "benchmark_failure_summary_json": str(json_path),
         "benchmark_failure_summary_md": str(md_path),
@@ -9400,6 +9427,13 @@ def run_experiment(experiment_config_path: Path, compact_summary: bool | None = 
                 for key in ("y_true_valid", "y_pred_valid", "y_proba_valid"):
                     if key in prefit_result.artifacts:
                         merged_artifacts[key] = prefit_result.artifacts[key]
+                prefit_runtime_override = prefit_result.artifacts.get("runtime_artifact_override")
+                retrained_runtime_override = retrained_result.artifacts.get("runtime_artifact_override")
+                if isinstance(retrained_runtime_override, dict):
+                    merged_runtime_override = dict(retrained_runtime_override)
+                    if isinstance(prefit_runtime_override, dict) and isinstance(prefit_runtime_override.get("X_valid"), pd.DataFrame):
+                        merged_runtime_override["X_valid"] = prefit_runtime_override.get("X_valid").copy()
+                    merged_artifacts["runtime_artifact_override"] = merged_runtime_override
                 result = retrained_result
                 result = type(result)(metrics=merged_metrics, artifacts=merged_artifacts)
             else:
@@ -9420,6 +9454,9 @@ def run_experiment(experiment_config_path: Path, compact_summary: bool | None = 
                 "params": result.artifacts.get("params", params),
                 "tuning_score": tuning_score,
             }
+            runtime_override = payload["artifacts"].pop("runtime_artifact_override", None)
+            if isinstance(runtime_override, dict):
+                runtime_artifact_overrides_by_model[model_name] = runtime_override
             payload["class_weight"] = dict(result.artifacts.get("class_weight_info", {}))
             payload["class_weight"]["class_weight_requested"] = _class_weight_requested(class_weight_cfg)
             payload["class_weight"]["model_name"] = model_name
@@ -9627,6 +9664,9 @@ def run_experiment(experiment_config_path: Path, compact_summary: bool | None = 
             experiment_id=experiment_id,
             requested_models=model_candidates,
             model_results=model_results,
+            failed_models=failed_models,
+            successful_models=successful_models,
+            reason="no_candidate_models_completed",
         )
         raise ValueError(
             "No candidate models completed successfully. "
@@ -9820,6 +9860,10 @@ def run_experiment(experiment_config_path: Path, compact_summary: bool | None = 
         "cross_validation": cv_reporting_cfg,
         "decision_policy": decision_rule_cfg,
         "summary_mode": "compact" if compact_mode else "full",
+        "successful_models": list(successful_models),
+        "failed_models": dict(failed_models),
+        "successful_candidate_count": int(len(successful_models)),
+        "failed_candidate_count": int(len(failed_models)),
     }
     if two_stage_enabled:
         summary["two_stage_feature_sharpening"] = (
@@ -9902,7 +9946,7 @@ def run_experiment(experiment_config_path: Path, compact_summary: bool | None = 
         class_metadata=class_metadata,
     )
     summary["artifact_paths"].update(contract_paths)
-    run_stamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    run_stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     summary["artifact_paths"].update(
         _persist_per_model_run_outputs(
             output_dir=output_dir,
@@ -9914,24 +9958,110 @@ def run_experiment(experiment_config_path: Path, compact_summary: bool | None = 
     )
 
     figure_status: dict[str, dict[str, Any]] = {}
+    summary["artifact_status"] = (
+        dict(summary.get("artifact_status", {}))
+        if isinstance(summary.get("artifact_status", {}), dict)
+        else {}
+    )
+    print(
+        "[finalization][start] "
+        f"successful_candidates={len(successful_models)} "
+        f"failed_candidates={len(failed_models)} "
+        f"best_model={best_model}"
+    )
+    summary["artifact_paths"]["benchmark_summary"] = str(output_dir / "benchmark_summary.json")
+    summary["artifact_paths"]["leaderboard"] = str(output_dir / "leaderboard.csv")
+    summary["artifact_paths"]["summary_csv"] = str(output_dir / "summary.csv")
+    summary["artifact_paths"]["benchmark_markdown"] = str(output_dir / "benchmark_summary.md")
+    summary["artifact_paths"]["artifact_manifest"] = str(output_dir / "artifact_manifest.json")
+    if stage2_feature_sharpening_report_path is not None:
+        summary["artifact_paths"]["stage2_feature_sharpening_report"] = str(stage2_feature_sharpening_report_path)
+    if stage2_advanced_feature_report_path is not None:
+        summary["artifact_paths"]["stage2_advanced_feature_report"] = str(stage2_advanced_feature_report_path)
+    for model_name, paths in optuna_artifacts.items():
+        model_token = _safe_filename_token(model_name)
+        summary["artifact_paths"][f"optuna_trials_{model_token}"] = paths["trials_csv"]
+        summary["artifact_paths"][f"optuna_best_params_{model_token}"] = paths["best_params_json"]
+    failure_artifacts: dict[str, str] = {}
+    if failed_models:
+        failure_artifacts = _write_benchmark_failure_summary(
+            output_dir=output_dir,
+            experiment_id=experiment_id,
+            requested_models=model_candidates,
+            model_results=model_results,
+            failed_models=failed_models,
+            successful_models=successful_models,
+            reason="partial_candidate_failures",
+        )
+        summary["artifact_paths"].update(failure_artifacts)
+    print("[finalization][summary_write_begin]")
+    try:
+        save_benchmark_summary(summary, output_dir, compact=compact_mode)
+        summary["artifact_paths"]["benchmark_summary"] = str(output_dir / "benchmark_summary.json")
+        summary["artifact_status"]["benchmark_summary"] = _status_from_path(output_dir / "benchmark_summary.json")
+        summary["artifact_status"]["leaderboard"] = _status_from_path(output_dir / "leaderboard.csv")
+        summary["artifact_status"]["summary_csv"] = _status_from_path(output_dir / "summary.csv")
+        print("[finalization][summary_written]")
+    except Exception as exc:
+        if failed_models:
+            _write_benchmark_failure_summary(
+                output_dir=output_dir,
+                experiment_id=experiment_id,
+                requested_models=model_candidates,
+                model_results=model_results,
+                failed_models=failed_models,
+                successful_models=successful_models,
+                reason=f"finalization_summary_write_failed:{type(exc).__name__}",
+            )
+        raise
+
+    mirror_enabled = bool(output_cfg.get("mirror_benchmark_outputs_to_runtime", False))
+    if mirror_enabled:
+        try:
+            mirrored = _mirror_root_artifacts_to_runtime(
+                output_dir=output_dir,
+                runtime_dir=output_dir / "runtime_artifacts",
+                model_candidates=model_candidates,
+            )
+            for name, path in mirrored.items():
+                summary["artifact_paths"][f"runtime_{name}"] = path
+        except Exception as exc:
+            print(f"[finalization][warning] runtime mirroring failed: {type(exc).__name__}: {exc}")
+            summary.setdefault("finalization_warnings", []).append(
+                f"runtime_mirroring_failed:{type(exc).__name__}: {exc}"
+            )
+
     if best_model and best_model in trained_models and trained_models[best_model] is not None:
         best_payload = model_results.get(best_model, {})
-        figure_result = generate_all_figures(
-            model=trained_models[best_model],
-            X_train=X_train_bal,
-            y_train=y_train_bal,
-            X_test=artifacts.X_test,
-            y_test=artifacts.y_test,
-            y_pred_proba=best_payload.get("artifacts", {}).get("y_proba_test"),
-            output_dir=output_dir,
-            experiment_name=experiment_id,
-            primary_metric=primary_metric,
-            random_state=seed,
-            include_status=True,
-        )
-        figure_paths = figure_result.get("artifact_paths", {})
-        figure_status = figure_result.get("artifact_status", {})
-        summary["artifact_paths"].update(figure_paths)
+        print("[finalization][figures_begin]")
+        try:
+            figure_result = generate_all_figures(
+                model=trained_models[best_model],
+                X_train=X_train_bal,
+                y_train=y_train_bal,
+                X_test=artifacts.X_test,
+                y_test=artifacts.y_test,
+                y_pred_proba=best_payload.get("artifacts", {}).get("y_proba_test"),
+                output_dir=output_dir,
+                experiment_name=experiment_id,
+                primary_metric=primary_metric,
+                random_state=seed,
+                include_status=True,
+            )
+            figure_paths = figure_result.get("artifact_paths", {})
+            figure_status = figure_result.get("artifact_status", {})
+            summary["artifact_paths"].update(figure_paths)
+            summary["artifact_status"].update(figure_status)
+            print("[finalization][figures_done]")
+        except Exception as exc:
+            print(f"[finalization][figures_failed] {type(exc).__name__}: {exc}")
+            figure_status = {
+                "learning_curve": {"status": "failed", "reason": f"figure_generation_failed:{type(exc).__name__}: {exc}"},
+                "pr_curve": {"status": "failed", "reason": f"figure_generation_failed:{type(exc).__name__}: {exc}"},
+                "shap_beeswarm": {"status": "failed", "reason": f"figure_generation_failed:{type(exc).__name__}: {exc}"},
+                "shap_waterfall": {"status": "failed", "reason": f"figure_generation_failed:{type(exc).__name__}: {exc}"},
+            }
+            summary["artifact_status"].update(figure_status)
     else:
         figure_status["learning_curve"] = {
             "status": "skipped",
@@ -9949,37 +10079,42 @@ def run_experiment(experiment_config_path: Path, compact_summary: bool | None = 
             "status": "skipped",
             "reason": "best_model_missing_or_unavailable",
         }
+        summary["artifact_status"].update(figure_status)
 
-    summary["artifact_paths"]["benchmark_summary"] = str(output_dir / "benchmark_summary.json")
-    summary["artifact_paths"]["leaderboard"] = str(output_dir / "leaderboard.csv")
-    summary["artifact_paths"]["summary_csv"] = str(output_dir / "summary.csv")
-    summary["artifact_paths"]["benchmark_markdown"] = str(output_dir / "benchmark_summary.md")
-    summary["artifact_paths"]["artifact_manifest"] = str(output_dir / "artifact_manifest.json")
-    if stage2_feature_sharpening_report_path is not None:
-        summary["artifact_paths"]["stage2_feature_sharpening_report"] = str(stage2_feature_sharpening_report_path)
-    if stage2_advanced_feature_report_path is not None:
-        summary["artifact_paths"]["stage2_advanced_feature_report"] = str(stage2_advanced_feature_report_path)
-    for model_name, paths in optuna_artifacts.items():
-        model_token = _safe_filename_token(model_name)
-        summary["artifact_paths"][f"optuna_trials_{model_token}"] = paths["trials_csv"]
-        summary["artifact_paths"][f"optuna_best_params_{model_token}"] = paths["best_params_json"]
-    _ensure_explainability_compatible_artifact_paths(summary)
-    save_benchmark_summary(summary, output_dir, compact=compact_mode)
-
-    mirror_enabled = bool(output_cfg.get("mirror_benchmark_outputs_to_runtime", False))
-    if mirror_enabled:
-        mirrored = _mirror_root_artifacts_to_runtime(
-            output_dir=output_dir,
-            runtime_dir=output_dir / "runtime_artifacts",
-            model_candidates=model_candidates,
+    try:
+        _ensure_explainability_compatible_artifact_paths(summary)
+    except Exception as exc:
+        print(f"[finalization][warning] explainability contract compatibility check failed: {type(exc).__name__}: {exc}")
+        summary.setdefault("finalization_warnings", []).append(
+            f"explainability_contract_check_failed:{type(exc).__name__}: {exc}"
         )
-        for name, path in mirrored.items():
-            summary["artifact_paths"][f"runtime_{name}"] = path
 
-    explain_json, explain_md = write_skipped_explainability_report(
-        output_dir=output_dir,
-        reason="explainability_not_run_yet",
-    )
+    try:
+        explain_json, explain_md = write_skipped_explainability_report(
+            output_dir=output_dir,
+            reason="explainability_not_run_yet",
+        )
+    except Exception as exc:
+        print(f"[finalization][warning] skipped explainability report failed: {type(exc).__name__}: {exc}")
+        explain_json = output_dir / "explainability" / "explainability_status.json"
+        explain_md = output_dir / "explainability" / "README.md"
+        summary.setdefault("finalization_warnings", []).append(
+            f"skipped_explainability_report_failed:{type(exc).__name__}: {exc}"
+        )
+
+    print("[finalization][summary_refresh_begin]")
+    try:
+        save_benchmark_summary(summary, output_dir, compact=compact_mode)
+        summary["artifact_paths"]["benchmark_summary"] = str(output_dir / "benchmark_summary.json")
+        summary["artifact_status"]["benchmark_summary"] = _status_from_path(output_dir / "benchmark_summary.json")
+        summary["artifact_status"]["leaderboard"] = _status_from_path(output_dir / "leaderboard.csv")
+        summary["artifact_status"]["summary_csv"] = _status_from_path(output_dir / "summary.csv")
+        print("[finalization][summary_refresh_done]")
+    except Exception as exc:
+        print(f"[finalization][warning] summary refresh failed: {type(exc).__name__}: {exc}")
+        summary.setdefault("finalization_warnings", []).append(
+            f"summary_refresh_failed:{type(exc).__name__}: {exc}"
+        )
 
     confusion_matrix_paths = sorted(output_dir.glob("confusion_matrix_*.png"))
     normalized_confusion_matrix_paths = sorted(output_dir.glob("confusion_matrix_*_normalized.png"))
@@ -10091,24 +10226,44 @@ def run_experiment(experiment_config_path: Path, compact_summary: bool | None = 
     if stage2_advanced_feature_report_path is not None:
         optional_updates["stage2_advanced_feature_report"] = _status_from_path(stage2_advanced_feature_report_path)
 
-    update_artifact_manifest(
-        output_dir=output_dir,
-        mandatory_updates=mandatory_updates,
-        optional_updates=optional_updates,
-        metadata_updates={
-            "experiment_id": experiment_id,
-            "dataset_name": dataset_name,
-            "target_formulation": formulation,
-            "best_model": best_model,
-            "manifest_scope": "benchmark",
-        },
-    )
-    if mirror_enabled:
-        _mirror_root_artifacts_to_runtime(
+    print("[finalization][manifest_begin]")
+    try:
+        update_artifact_manifest(
             output_dir=output_dir,
-            runtime_dir=output_dir / "runtime_artifacts",
-            model_candidates=model_candidates,
+            mandatory_updates=mandatory_updates,
+            optional_updates=optional_updates,
+            metadata_updates={
+                "experiment_id": experiment_id,
+                "dataset_name": dataset_name,
+                "target_formulation": formulation,
+                "best_model": best_model,
+                "manifest_scope": "benchmark",
+            },
         )
+        print("[finalization][manifest_done]")
+    except Exception as exc:
+        print(f"[finalization][manifest_failed] {type(exc).__name__}: {exc}")
+        summary.setdefault("finalization_warnings", []).append(
+            f"artifact_manifest_update_failed:{type(exc).__name__}: {exc}"
+        )
+    if mirror_enabled:
+        try:
+            _mirror_root_artifacts_to_runtime(
+                output_dir=output_dir,
+                runtime_dir=output_dir / "runtime_artifacts",
+                model_candidates=model_candidates,
+            )
+        except Exception as exc:
+            print(f"[finalization][warning] post-manifest runtime mirroring failed: {type(exc).__name__}: {exc}")
+            summary.setdefault("finalization_warnings", []).append(
+                f"post_manifest_runtime_mirroring_failed:{type(exc).__name__}: {exc}"
+            )
+    if summary.get("finalization_warnings"):
+        try:
+            save_benchmark_summary(summary, output_dir, compact=compact_mode)
+        except Exception:
+            pass
+    print("[finalization][complete]")
     return summary
 
 
