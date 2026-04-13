@@ -12,6 +12,8 @@ from sklearn.impute import SimpleImputer
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
 
+from src.preprocessing.outlier import apply_outlier_filter
+
 DEFAULT_FORBIDDEN_FEATURE_COLUMNS = {"final_result"}
 
 
@@ -35,6 +37,40 @@ def detect_feature_types(X: pd.DataFrame) -> tuple[list[str], list[str]]:
     return numeric_cols, categorical_cols
 
 
+def _normalize_missing_for_sklearn(X: pd.DataFrame) -> pd.DataFrame:
+    """Convert pandas missing sentinels to np.nan before sklearn preprocessing."""
+    normalized = X.copy()
+    return normalized.where(pd.notna(normalized), np.nan)
+
+
+def _log_preprocessing_debug(
+    split_name: str,
+    X: pd.DataFrame,
+    numeric_cols: list[str],
+    categorical_cols: list[str],
+) -> None:
+    object_cols_with_missing = [
+        column
+        for column in X.select_dtypes(include=["object", "string"]).columns.tolist()
+        if X[column].isna().any()
+    ]
+    print(
+        "[preprocessing][tabular] "
+        f"split={split_name} shape={X.shape} "
+        f"numeric_cols={len(numeric_cols)} categorical_cols={len(categorical_cols)} "
+        f"object_cols_with_missing={object_cols_with_missing}"
+    )
+
+
+def _normalize_encoder_drop(raw_drop: Any) -> Any:
+    if raw_drop is None:
+        return None
+    token = str(raw_drop).strip().lower()
+    if token in {"", "none", "false", "null"}:
+        return None
+    return raw_drop
+
+
 def _build_transformer(
     numeric_cols: list[str],
     categorical_cols: list[str],
@@ -45,6 +81,10 @@ def _build_transformer(
     categorical_imputer_strategy = str(preprocessing_cfg.get("categorical_imputation", "most_frequent"))
     use_scaler = bool(preprocessing_cfg.get("scaling", True))
     use_onehot = bool(preprocessing_cfg.get("onehot", True))
+    encoder_handle_unknown = str(preprocessing_cfg.get("onehot_handle_unknown", "ignore")).strip().lower()
+    encoder_drop = _normalize_encoder_drop(preprocessing_cfg.get("onehot_drop"))
+    locked_categories_map = preprocessing_cfg.get("onehot_categories")
+    encoder_categories = None
 
     num_steps: list[tuple[str, Any]] = [("imputer", SimpleImputer(strategy=numeric_imputer_strategy))]
     if use_scaler:
@@ -52,10 +92,22 @@ def _build_transformer(
     num_pipeline = Pipeline(steps=num_steps)
 
     if use_onehot:
+        if isinstance(locked_categories_map, dict) and categorical_cols:
+            encoder_categories = [list(locked_categories_map.get(column, [])) for column in categorical_cols]
         try:
-            onehot = OneHotEncoder(handle_unknown="ignore", sparse_output=False)
+            onehot = OneHotEncoder(
+                handle_unknown=encoder_handle_unknown,
+                sparse_output=False,
+                drop=encoder_drop,
+                categories=encoder_categories,
+            )
         except TypeError:
-            onehot = OneHotEncoder(handle_unknown="ignore", sparse=False)
+            onehot = OneHotEncoder(
+                handle_unknown=encoder_handle_unknown,
+                sparse=False,
+                drop=encoder_drop,
+                categories=encoder_categories,
+            )
     else:
         onehot = "passthrough"
 
@@ -102,6 +154,15 @@ def _extract_features_target(
     return X, y
 
 
+def _resolve_raw_train_outlier_config(config: dict[str, Any]) -> dict[str, Any]:
+    raw_cfg = config.get("outlier", {}) if isinstance(config.get("outlier", {}), dict) else {}
+    return {
+        **raw_cfg,
+        "enabled": bool(raw_cfg.get("enabled", False)),
+        "apply_before_preprocessing": bool(raw_cfg.get("apply_before_preprocessing", False)),
+    }
+
+
 def run_tabular_preprocessing(split_data: dict[str, pd.DataFrame], config: dict[str, Any]) -> TabularPipelineArtifacts:
     """Fit preprocessing on train split and transform train/valid/test consistently."""
     target_column = str(config.get("target_column", "target"))
@@ -146,7 +207,18 @@ def run_tabular_preprocessing(split_data: dict[str, pd.DataFrame], config: dict[
         forbidden_feature_columns=forbidden_feature_columns,
     )
 
+    raw_train_outlier_cfg = _resolve_raw_train_outlier_config(config)
+    if bool(raw_train_outlier_cfg.get("enabled", False)) and bool(raw_train_outlier_cfg.get("apply_before_preprocessing", False)):
+        X_train_raw, y_train, outlier_meta = apply_outlier_filter(X_train_raw, y_train, raw_train_outlier_cfg)
+    else:
+        outlier_meta = {"enabled": False, "method": None, "applied_before_preprocessing": False}
+
+    X_train_raw = _normalize_missing_for_sklearn(X_train_raw)
+    X_valid_raw = _normalize_missing_for_sklearn(X_valid_raw)
+    X_test_raw = _normalize_missing_for_sklearn(X_test_raw)
+
     numeric_cols, categorical_cols = detect_feature_types(X_train_raw)
+    _log_preprocessing_debug("train", X_train_raw, numeric_cols, categorical_cols)
     transformer = _build_transformer(numeric_cols, categorical_cols, config=config)
     X_train_arr = transformer.fit_transform(X_train_raw)
 
@@ -159,6 +231,28 @@ def run_tabular_preprocessing(split_data: dict[str, pd.DataFrame], config: dict[
         X_valid = pd.DataFrame(transformer.transform(X_valid_raw), columns=feature_names, index=X_valid_raw.index)
     X_test = pd.DataFrame(transformer.transform(X_test_raw), columns=feature_names, index=X_test_raw.index)
 
+    locked_vocabulary_requested = bool(config.get("lock_category_vocabulary_from_pre_split_train", False))
+    onehot_categories_map = config.get("onehot_categories")
+    onehot_categories_source = config.get("onehot_categories_source")
+    onehot_column_category_counts: dict[str, int] = {}
+    onehot_column_category_labels: dict[str, list[str]] = {}
+    encoded_categorical_feature_count = 0
+    if bool(config.get("onehot", False)) and categorical_cols:
+        try:
+            cat_pipeline = transformer.named_transformers_.get("cat")  # type: ignore[attr-defined]
+            encoder = cat_pipeline.named_steps.get("encoder") if hasattr(cat_pipeline, "named_steps") else None
+            categories = getattr(encoder, "categories_", None)
+            if categories is not None:
+                for column, column_categories in zip(categorical_cols, categories):
+                    labels = [str(value) for value in list(column_categories)]
+                    onehot_column_category_labels[column] = labels
+                    onehot_column_category_counts[column] = int(len(labels))
+                encoded_categorical_feature_count = int(sum(onehot_column_category_counts.values()))
+        except Exception:
+            onehot_column_category_counts = {}
+            onehot_column_category_labels = {}
+            encoded_categorical_feature_count = 0
+
     metadata = {
         "target_column": target_column,
         "id_columns": id_columns,
@@ -166,6 +260,20 @@ def run_tabular_preprocessing(split_data: dict[str, pd.DataFrame], config: dict[
         "numeric_columns": numeric_cols,
         "categorical_columns": categorical_cols,
         "output_feature_names": feature_names,
+        "numeric_feature_count": int(len(numeric_cols)),
+        "categorical_feature_count": int(len(categorical_cols)),
+        "onehot_categories_locked": locked_vocabulary_requested and isinstance(onehot_categories_map, dict),
+        "onehot_categories_source": str(onehot_categories_source) if onehot_categories_source else None,
+        "onehot_column_category_counts": onehot_column_category_counts,
+        "onehot_column_category_labels": onehot_column_category_labels,
+        "encoded_categorical_feature_count": int(encoded_categorical_feature_count),
+        "preprocessed_feature_count": int(len(feature_names)),
         "transformer": transformer,
+        "train_only_outlier": {
+            **outlier_meta,
+            "applied_before_preprocessing": bool(
+                raw_train_outlier_cfg.get("enabled", False) and raw_train_outlier_cfg.get("apply_before_preprocessing", False)
+            ),
+        },
     }
     return TabularPipelineArtifacts(X_train, X_valid, X_test, y_train, y_valid, y_test, metadata)

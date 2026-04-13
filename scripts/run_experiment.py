@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+# Imports
+
 import argparse
 import copy
 from datetime import datetime, timezone
@@ -35,12 +37,19 @@ from src.data.feature_builders.uct_stage2_feature_sharpening import (
     DEFAULT_STAGE2_FEATURE_GROUPS,
     build_stage2_feature_sharpening_split_data,
 )
+from src.data.feature_builders.uct_stage2_feature_separation import (
+    DEFAULT_ADVANCED_ENROLLED_FEATURE_SEPARATION_GROUPS,
+    build_advanced_enrolled_feature_separation_split_data,
+)
 from src.data.feature_builders.uct_stage2_advanced_features import (
     DEFAULT_INTERACTION_GROUPS,
     DEFAULT_PROTOTYPE_METRIC_SET,
     build_stage2_interaction_split_data,
     build_stage2_prototype_distance_features,
     build_stage2_selective_interaction_split_data,
+)
+from src.data.feature_builders.uci_student_paper_style_features import (
+    build_uci_student_paper_style_features,
 )
 from src.data.feature_builders.uct_student_features import build_uct_student_features
 from src.data.loaders.oulad_loader import load_oulad_tables
@@ -62,1813 +71,164 @@ from src.models.train_eval import (
 from src.models.two_stage_uct import Stage2PositiveProbabilityCalibrator, TwoStageUct3ClassClassifier
 from src.preprocessing.balancing import apply_balancing
 from src.preprocessing.outlier import apply_outlier_filter
-from src.preprocessing.tabular_pipeline import run_tabular_preprocessing
+from src.preprocessing.tabular_pipeline import detect_feature_types, run_tabular_preprocessing
 from src.reporting.artifact_manifest import update_artifact_manifest
 from src.reporting.benchmark_contract import BENCHMARK_SUMMARY_VERSION, REQUIRED_EXPLAINABILITY_ARTIFACT_KEYS
 from src.reporting.benchmark_summary import save_benchmark_summary
-from src.reporting.error_audit import run_uct_3class_error_audit
 from src.reporting.generate_all_figures import generate_all_figures
 from src.reporting.standard_artifacts import (
     ensure_standard_output_layout,
     resolve_results_dir,
     write_skipped_explainability_report,
 )
-from src.reporting.threshold_tuning import run_threshold_tuning_experiment
-
-DATASET_NAME_ALIASES = {
-    "uct": "uct_student",
-    "uci": "uct_student",
-    "uci_student": "uct_student",
-    "uci_student_presplit_parquet": "uct_student",
-    "uci-student": "uct_student",
-    "uct_student": "uct_student",
-    "uct-student": "uct_student",
-    "oulad": "oulad",
-    "open university learning analytics dataset": "oulad",
-}
+from src.experiment.runners import (
+    run_benchmark_mode,
+    run_error_audit_mode,
+    run_threshold_tuning_mode,
+    run_two_stage_mode,
+)
+from src.experiment.config_resolution import (
+    _deep_merge_dicts,
+    _normalize_dataset_name,
+    _normalize_experiment_config_schema,
+    _resolve_cv_reporting_config,
+    _resolve_decision_rule_config,
+    _resolve_experiment_feature_config,
+    _resolve_global_balance_guard_config,
+    _resolve_model_decision_rule_config,
+    _resolve_model_selection_config,
+    _resolve_per_model_trial_budgets,
+    _resolve_two_stage_stage2_advanced_config,
+    _resolve_two_stage_stage2_feature_separation_config,
+    _resolve_two_stage_stage2_feature_sharpening_config,
+    _resolve_two_stage_stage2_finite_sanitation_config,
+    _resolve_two_stage_stage2_selective_interactions_config,
+    load_yaml,
+)
+from src.experiment.eval_validation import (
+    _assert_1d_label_vector,
+    _assert_probability_payload,
+    _assert_same_length_arrays,
+    _debug_lengths,
+    _validate_two_stage_eval_bundle,
+)
+from src.experiment.feature_sanitation import validate_and_sanitize_feature_matrix
+from src.experiment.finalization import (
+    finalize_benchmark_run,
+    finalize_error_audit_run,
+    finalize_threshold_tuning_run,
+)
+from src.experiment.finalization.shared_types import (
+    BenchmarkExecutionResult,
+    BenchmarkFinalizationContext,
+)
+from src.experiment.model_selection import _apply_global_balance_guard, _sort_leaderboard_with_tiebreak
+from src.experiment.schema_validation import (
+    _duplicate_columns,
+    _log_duplicate_feature_check,
+    _sanitize_lightgbm_feature_frames,
+    _sanitize_lightgbm_feature_name,
+    _sanitize_lightgbm_feature_names,
+    align_feature_schema,
+    validate_feature_schema,
+)
+from src.experiment.two_stage_feature_bundle import _prepare_two_stage_stage2_feature_bundle
+from src.reporting.prediction_exports import (
+    _add_named_cv_per_class_metrics,
+    _add_named_per_class_metrics,
+    _add_named_per_class_metrics_with_suffix,
+    _add_named_validation_per_class_metrics,
+    _build_prediction_export_dataframe,
+    _metric_label_token,
+    _resolve_metric_column,
+    _safe_filename_token,
+)
+from src.reporting.runtime_persistence import (
+    _ensure_explainability_compatible_artifact_paths,
+    _mirror_root_artifacts_to_runtime,
+    _persist_per_model_run_outputs,
+    _persist_required_contract_outputs,
+    _persist_runtime_artifacts,
+    _save_dataframe,
+    _save_series,
+    _status_from_path,
+    _write_benchmark_failure_summary,
+)
 SUPPORTED_DATASETS = {"uct_student", "oulad"}
 
+# Orchestration helpers still local
 
-def load_yaml(path: Path) -> dict[str, Any]:
-    try:
-        import yaml
-    except ImportError as exc:
-        raise ImportError("PyYAML is required to load experiment configs. Install with `pip install pyyaml`.") from exc
-    with path.open("r", encoding="utf-8") as f:
-        return yaml.safe_load(f) or {}
-
-
-def _deep_merge_dicts(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
-    merged = copy.deepcopy(base)
-    for key, value in override.items():
-        if isinstance(value, dict) and isinstance(merged.get(key), dict):
-            merged[key] = _deep_merge_dicts(merged[key], value)
-        else:
-            merged[key] = copy.deepcopy(value)
-    return merged
-
-
-def _normalize_experiment_config_schema(exp_cfg: dict[str, Any]) -> dict[str, Any]:
-    """Accept both native and lightweight analysis-only experiment schemas."""
-    if "experiment" in exp_cfg:
-        return exp_cfg
-
-    experiment_name = exp_cfg.get("experiment_name")
-    task_type = str(exp_cfg.get("task_type", "")).strip().lower()
-    dataset_name = str(exp_cfg.get("dataset", {}).get("name", "")).strip().lower()
-    input_cfg = exp_cfg.get("input", {})
-    output_cfg = exp_cfg.get("output", {})
-    analysis_cfg = exp_cfg.get("analysis", {})
-    evaluation_cfg = exp_cfg.get("evaluation", {})
-    preprocessing_cfg = exp_cfg.get("preprocessing", {})
-
-    if not experiment_name:
-        return exp_cfg
-
-    mode = "benchmark"
-    if task_type == "analysis_only":
-        mode = "error_audit"
-    elif task_type in {"threshold_tuning", "posthoc_threshold_tuning"}:
-        mode = "threshold_tuning"
-    target_mode = str(exp_cfg.get("target", {}).get("mode", "")).strip().lower()
-    target_formulation = "binary"
-    if "3class" in dataset_name or "three_class" in dataset_name or target_mode in {"3class", "three_class"}:
-        target_formulation = "three_class"
-    elif target_mode in {"4class", "four_class"}:
-        target_formulation = "four_class"
-
-    dataset_config = "configs/datasets/uct_student.yaml"
-    if dataset_name == "oulad":
-        dataset_config = "configs/datasets/oulad.yaml"
-
-    model_aliases = {
-        "xgboost_optuna": "xgboost",
-        "lightgbm_optuna": "lightgbm",
-        "catboost_optuna": "catboost",
-    }
-    raw_models = exp_cfg.get("models", [])
-    candidates: list[str] = []
-    if isinstance(raw_models, list):
-        for model in raw_models:
-            token = str(model).strip().lower()
-            candidates.append(model_aliases.get(token, token.removesuffix("_optuna")))
-    if not candidates:
-        candidates = ["xgboost", "lightgbm", "catboost"]
-
-    optimization_cfg = exp_cfg.get("optimization", {})
-    threshold_tuning_cfg = exp_cfg.get("threshold_tuning", {})
-    eval_metrics = [str(m) for m in evaluation_cfg.get("metrics", [])]
-    objective_metric = str(optimization_cfg.get("objective_metric", "macro_f1"))
-    if mode == "threshold_tuning":
-        objective_metric = str(threshold_tuning_cfg.get("objective_metric", "macro_f1"))
-    scoring_name = "f1_macro" if objective_metric == "macro_f1" else objective_metric
-    secondary_metrics = [m for m in eval_metrics if m and m != objective_metric]
-    split_cfg = exp_cfg.get("split", {})
-    random_state = int(split_cfg.get("random_state", 42))
-
-    output_results_dir = output_cfg.get("results_dir") or output_cfg.get("dir") or f"results/{experiment_name}"
-
-    training_class_weight_cfg = (
-        exp_cfg.get("training", {}).get("class_weight", {})
-        if isinstance(exp_cfg.get("training", {}).get("class_weight", {}), dict)
-        else {}
-    )
-    class_weight_payload: dict[str, Any] = {"enabled": bool(exp_cfg.get("training", {}).get("use_class_weights", False))}
-    if training_class_weight_cfg:
-        class_weight_payload = {"enabled": True, **training_class_weight_cfg}
-
-    normalized: dict[str, Any] = {
-        "experiment": {
-            "id": str(experiment_name),
-            "mode": mode,
-            "seed": random_state,
-            "dataset_config": dataset_config,
-            "target_formulation": target_formulation,
-        },
-        "splits": {
-            "test_size": 0.2,
-            "validation_size": 0.2,
-            "stratify_column": "target",
-        },
-        "preprocessing": {
-            "imputation": preprocessing_cfg.get("imputation", "median_mode"),
-            "encoding": preprocessing_cfg.get("encoding", "onehot"),
-            "scaling": preprocessing_cfg.get("scaling", "standard"),
-            "outlier": preprocessing_cfg.get("outlier", {"enabled": True, "method": "isolation_forest"}),
-            "balancing": preprocessing_cfg.get("balancing", {"enabled": True, "method": "smote"}),
-        },
-        "inputs": {
-            "benchmark_summary_path": input_cfg.get("benchmark_summary"),
-            "benchmark_results_root": "results",
-        },
-        "analysis": {
-            "top_k_models": analysis_cfg.get("top_k_models"),
-            "models": analysis_cfg.get("models"),
-            "threshold_grid": analysis_cfg.get("threshold_grid") or threshold_tuning_cfg.get("threshold_grid"),
-            "split_source": split_cfg.get("source", "validation"),
-        },
-        "models": {
-            "candidates": candidates,
-            "tuning": {
-                "backend": str(optimization_cfg.get("engine", "none")),
-                "n_trials": int(optimization_cfg.get("n_trials", 0)),
-                "cv_folds": 3,
-                "scoring": scoring_name,
-                "objective_source": "validation",
-            },
-            "class_weight": class_weight_payload,
-            "retrain_on_full_train_split": True,
-        },
-        "metrics": {
-            "primary": objective_metric,
-            "secondary": secondary_metrics,
-        },
-        "evaluation": {
-            "metrics": eval_metrics,
-            "compare_default_argmax": bool(evaluation_cfg.get("compare_default_argmax", False)),
-            "decision_rule": str(evaluation_cfg.get("decision_rule", exp_cfg.get("training", {}).get("decision_rule", "model_predict"))),
-            "cross_validation": evaluation_cfg.get("cross_validation", {}),
-            "save_confusion_matrix": bool(evaluation_cfg.get("save_confusion_matrix", True)),
-            "save_classification_report": bool(evaluation_cfg.get("save_classification_report", True)),
-        },
-        "inference": exp_cfg.get("inference", {}) if isinstance(exp_cfg.get("inference", {}), dict) else {},
-        "artifact_policy": exp_cfg.get("artifact_policy", {}),
-        "outputs": {
-            "results_dir": output_results_dir,
-            "save_artifact_manifest": bool(output_cfg.get("save_artifact_manifest", True)),
-        },
-    }
-    if mode == "threshold_tuning":
-        # Preserve defaults in threshold-tuning runner if grid is not explicitly provided.
-        normalized["analysis"]["models"] = analysis_cfg.get("models")
-        normalized["analysis"]["threshold_grid"] = (
-            analysis_cfg.get("threshold_grid")
-            or threshold_tuning_cfg.get("threshold_grid")
-            or {}
-        )
-    return normalized
-
-
-def _save_dataframe(df: pd.DataFrame, preferred_path: Path) -> Path:
-    preferred_path.parent.mkdir(parents=True, exist_ok=True)
-    if preferred_path.suffix.lower() == ".csv":
-        df.to_csv(preferred_path, index=False)
-        return preferred_path
-    try:
-        df.to_parquet(preferred_path, index=False)
-        return preferred_path
-    except Exception:
-        fallback = preferred_path.with_suffix(".csv")
-        df.to_csv(fallback, index=False)
-        return fallback
-
-
-def _save_series(series: pd.Series, preferred_path: Path) -> Path:
-    preferred_path.parent.mkdir(parents=True, exist_ok=True)
-    payload = pd.DataFrame({"value": series.reset_index(drop=True)})
-    if preferred_path.suffix.lower() == ".csv":
-        payload.to_csv(preferred_path, index=False)
-        return preferred_path
-    try:
-        payload.to_parquet(preferred_path, index=False)
-        return preferred_path
-    except Exception:
-        fallback = preferred_path.with_suffix(".csv")
-        payload.to_csv(fallback, index=False)
-        return fallback
-
-
-def _persist_runtime_artifacts(
-    output_dir: Path,
-    best_model_name: str | None,
-    trained_models: dict[str, Any],
-    preprocessing_artifacts: Any,
-    summary: dict[str, Any],
-    runtime_artifact_overrides_by_model: dict[str, dict[str, Any]] | None = None,
-    file_format: str = "parquet",
-) -> dict[str, str]:
-    runtime_dir = output_dir / "runtime_artifacts"
-    runtime_dir.mkdir(parents=True, exist_ok=True)
-    artifact_paths: dict[str, str] = {}
-
-    if best_model_name and best_model_name in trained_models:
-        model_path = runtime_dir / "best_model.joblib"
-        joblib.dump(trained_models[best_model_name], model_path)
-        artifact_paths["best_model"] = str(model_path)
-
-    transformer_path = runtime_dir / "preprocessing_transformer.joblib"
-    transformer = preprocessing_artifacts.metadata.get("transformer")
-    if transformer is not None:
-        joblib.dump(transformer, transformer_path)
-        artifact_paths["preprocessing_transformer"] = str(transformer_path)
-
-    override_payload: dict[str, Any] = {}
-    if best_model_name and isinstance(runtime_artifact_overrides_by_model, dict):
-        override_payload = runtime_artifact_overrides_by_model.get(best_model_name, {}) or {}
-    X_train_runtime = override_payload.get("X_train", preprocessing_artifacts.X_train)
-    X_valid_runtime = override_payload.get("X_valid", preprocessing_artifacts.X_valid)
-    X_test_runtime = override_payload.get("X_test", preprocessing_artifacts.X_test)
-    runtime_feature_names = override_payload.get(
-        "feature_names",
-        preprocessing_artifacts.metadata.get("output_feature_names", []),
-    )
-
-    ext = ".csv" if str(file_format).strip().lower() == "csv" else ".parquet"
-    X_train_path = _save_dataframe(X_train_runtime, runtime_dir / f"X_train_preprocessed{ext}")
-    X_valid_path = _save_dataframe(X_valid_runtime, runtime_dir / f"X_valid_preprocessed{ext}")
-    X_test_path = _save_dataframe(X_test_runtime, runtime_dir / f"X_test_preprocessed{ext}")
-    y_train_path = _save_series(preprocessing_artifacts.y_train, runtime_dir / f"y_train{ext}")
-    y_valid_path = _save_series(preprocessing_artifacts.y_valid, runtime_dir / f"y_valid{ext}")
-    y_test_path = _save_series(preprocessing_artifacts.y_test, runtime_dir / f"y_test{ext}")
-
-    artifact_paths.update(
-        {
-            "X_train_preprocessed": str(X_train_path),
-            "X_valid_preprocessed": str(X_valid_path),
-            "X_test_preprocessed": str(X_test_path),
-            "y_train": str(y_train_path),
-            "y_valid": str(y_valid_path),
-            "y_test": str(y_test_path),
-        }
-    )
-
-    metadata_path = runtime_dir / "runtime_metadata.json"
-    metadata_payload = {
-        "experiment_id": summary.get("experiment_id"),
-        "dataset_name": summary.get("dataset_name"),
-        "target_formulation": summary.get("target_formulation"),
-        "class_metadata": summary.get("class_metadata", {}),
-        "best_model": best_model_name,
-        "feature_names": runtime_feature_names,
-        "class_weight": summary.get("class_weight", {}),
-        "threshold_tuning": summary.get("threshold_tuning", {}),
-        "best_model_threshold_tuning": (
-            summary.get("model_results", {}).get(best_model_name, {}).get("threshold_tuning", {})
-            if best_model_name
-            else {}
-        ),
-        "model_mechanism_audit": summary.get("model_mechanism_audit", {}),
-    }
-    metadata_path.write_text(json.dumps(metadata_payload, indent=2), encoding="utf-8")
-    artifact_paths["runtime_metadata"] = str(metadata_path)
-    return artifact_paths
-
-
-def _persist_required_contract_outputs(
-    output_dir: Path,
-    summary: dict[str, Any],
-    best_model_name: str | None,
-    trained_models: dict[str, Any],
-    y_test: pd.Series,
-    class_metadata: dict[str, Any] | None = None,
-) -> dict[str, str]:
-    """Persist model/, metrics.json, and predictions.csv required by collaboration contract."""
-    paths: dict[str, str] = {}
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    model_dir = output_dir / "model"
-    model_dir.mkdir(parents=True, exist_ok=True)
-    if best_model_name and best_model_name in trained_models and trained_models[best_model_name] is not None:
-        model_path = model_dir / "best_model.joblib"
-        joblib.dump(trained_models[best_model_name], model_path)
-        paths["model_dir"] = str(model_dir)
-        paths["best_model"] = str(model_path)
-        paths["best_model_copy"] = str(model_path)
-    else:
-        paths["model_dir"] = str(model_dir)
-
-    metrics_payload = {
-        "experiment_id": summary.get("experiment_id"),
-        "dataset_name": summary.get("dataset_name"),
-        "target_formulation": summary.get("target_formulation"),
-        "primary_metric": summary.get("primary_metric"),
-        "best_model": best_model_name,
-        "class_weight": summary.get("class_weight", {}),
-        "threshold_tuning": summary.get("threshold_tuning", {}),
-        "best_model_threshold_tuning": (
-            summary.get("model_results", {}).get(best_model_name, {}).get("threshold_tuning", {})
-            if best_model_name
-            else {}
-        ),
-        "model_mechanism_audit": summary.get("model_mechanism_audit", {}),
-        "best_model_metrics": (
-            summary.get("model_results", {}).get(best_model_name, {}).get("metrics", {}) if best_model_name else {}
-        ),
-        "leaderboard": summary.get("leaderboard", []),
-    }
-    metrics_path = output_dir / "metrics.json"
-    metrics_path.write_text(json.dumps(metrics_payload, indent=2), encoding="utf-8")
-    paths["metrics"] = str(metrics_path)
-
-    if best_model_name:
-        best_payload = summary.get("model_results", {}).get(best_model_name, {})
-        best_artifacts = best_payload.get("artifacts", {})
-        y_pred = best_artifacts.get("y_pred_test")
-        y_proba = best_artifacts.get("y_proba_test")
-        labels = best_artifacts.get("labels") or []
-        pred_df = _build_prediction_export_dataframe(
-            y_true=y_test,
-            y_pred=y_pred,
-            y_proba=y_proba,
-            labels=labels,
-            class_metadata=class_metadata,
-            extra_columns=best_artifacts.get("prediction_export_test"),
-        )
-    else:
-        pred_df = pd.DataFrame({"y_true": y_test.reset_index(drop=True)})
-
-    predictions_path = output_dir / "predictions.csv"
-    pred_df.to_csv(predictions_path, index=False)
-    paths["predictions"] = str(predictions_path)
-    return paths
-
-
-def _status_from_path(path: str | Path, missing_reason: str = "missing_expected_output") -> dict[str, str]:
-    resolved = Path(path)
-    if resolved.exists():
-        return {"status": "generated", "path": str(resolved)}
-    return {"status": "failed", "path": str(resolved), "reason": missing_reason}
-
-
-def _ensure_explainability_compatible_artifact_paths(summary: dict[str, Any]) -> None:
-    artifact_paths = summary.get("artifact_paths")
-    if not isinstance(artifact_paths, dict):
-        raise ValueError("Cannot write explainability-compatible benchmark_summary: missing artifact_paths object.")
-
-    best_model_path = artifact_paths.get("best_model")
-    if not best_model_path:
-        fallback_best_model = artifact_paths.get("best_model_copy")
-        if fallback_best_model:
-            artifact_paths["best_model"] = str(fallback_best_model)
-            best_model_path = artifact_paths["best_model"]
-
-    missing: list[str] = []
-    missing_files: list[str] = []
-    for key in REQUIRED_EXPLAINABILITY_ARTIFACT_KEYS:
-        value = artifact_paths.get(key)
-        if not value:
-            missing.append(key)
-            continue
-        if not Path(str(value)).exists():
-            missing_files.append(f"{key}={value}")
-
-    if missing:
-        raise ValueError(
-            "Cannot write explainability-compatible benchmark_summary: "
-            f"missing required artifact path entries {missing}."
-        )
-    if missing_files:
-        raise ValueError(
-            "Cannot write explainability-compatible benchmark_summary: "
-            f"required artifacts do not exist on disk: {missing_files}."
-        )
-
-
-def _write_benchmark_failure_summary(
-    output_dir: Path,
-    *,
-    experiment_id: str,
-    requested_models: list[str],
-    model_results: dict[str, Any],
-    failed_models: dict[str, str] | None = None,
-    successful_models: list[str] | None = None,
-    reason: str = "no_candidate_models_completed",
-) -> dict[str, str]:
-    output_dir.mkdir(parents=True, exist_ok=True)
-    failed_payload = failed_models if isinstance(failed_models, dict) else {}
-    successful_payload = successful_models if isinstance(successful_models, list) else []
-    status = "failed" if not successful_payload else "partial_success"
-    failure_payload = {
-        "experiment_id": experiment_id,
-        "status": status,
-        "reason": reason,
-        "requested_models": list(requested_models),
-        "successful_models": list(successful_payload),
-        "successful_candidate_count": int(len(successful_payload)),
-        "failed_models": {
-            str(model_name): {
-                "error": str(error_msg),
-                "exception_class": str(str(error_msg).split(":", 1)[0]).strip() if error_msg else "",
-                "message": str(str(error_msg).split(":", 1)[1]).strip() if isinstance(error_msg, str) and ":" in error_msg else str(error_msg),
-            }
-            for model_name, error_msg in failed_payload.items()
-        },
-        "failed_candidate_count": int(len(failed_payload)),
-        "model_results": model_results,
-    }
-    json_path = output_dir / "benchmark_failure_summary.json"
-    md_path = output_dir / "benchmark_failure_summary.md"
-    json_path.write_text(json.dumps(failure_payload, indent=2), encoding="utf-8")
-    lines = [
-        "# Benchmark Failure Summary",
-        "",
-        f"- Experiment ID: `{experiment_id}`",
-        f"- Status: `{status}`",
-        f"- Reason: `{reason}`",
-        f"- Requested models: `{requested_models}`",
-        f"- Successful models: `{successful_payload}`",
-        f"- Failed model count: `{len(failed_payload)}`",
-        "",
-        "## Model Failures",
-        "",
-    ]
-    for model_name in requested_models:
-        if model_name not in failed_payload:
-            continue
-        error_msg = failed_payload.get(model_name, "unknown_failure")
-        lines.append(f"- `{model_name}`: `{error_msg}`")
-    md_path.write_text("\n".join(lines), encoding="utf-8")
-    print(
-        "[finalization][failure_summary] "
-        f"status={status} reason={reason} "
-        f"successful_candidates={len(successful_payload)} "
-        f"failed_candidates={len(failed_payload)} "
-        f"path={json_path}"
-    )
-    return {
-        "benchmark_failure_summary_json": str(json_path),
-        "benchmark_failure_summary_md": str(md_path),
-    }
-
-
-def align_feature_schema(
-    reference_df: pd.DataFrame,
-    target_df: pd.DataFrame,
-    *,
-    fill_value: float = np.nan,
-) -> pd.DataFrame:
-    aligned = target_df.copy()
-    for col in reference_df.columns:
-        if col not in aligned.columns:
-            aligned[col] = fill_value
-    aligned = aligned.loc[:, list(reference_df.columns)]
-    return aligned
-
-
-def _duplicate_columns(df: pd.DataFrame) -> list[str]:
-    counts = pd.Series(df.columns).value_counts()
-    return [str(col) for col, count in counts.items() if int(count) > 1]
-
-
-def validate_feature_schema(
-    reference_df: pd.DataFrame,
-    target_df: pd.DataFrame,
-    *,
-    context: str,
-) -> None:
-    duplicate_reference = _duplicate_columns(reference_df)
-    duplicate_target = _duplicate_columns(target_df)
-    if duplicate_reference or duplicate_target:
-        raise ValueError(
-            f"{context}: duplicate columns detected. "
-            f"reference_duplicates={duplicate_reference}, target_duplicates={duplicate_target}"
-        )
-    ref_cols = list(reference_df.columns)
-    tgt_cols = list(target_df.columns)
-    if ref_cols == tgt_cols:
-        print(f"[v8] schema validation before {context}: passed")
-        return
-    ref_set = set(ref_cols)
-    tgt_set = set(tgt_cols)
-    missing = [col for col in ref_cols if col not in tgt_set]
-    extra = [col for col in tgt_cols if col not in ref_set]
-    mismatched_positions: list[dict[str, Any]] = []
-    for idx, (ref_col, tgt_col) in enumerate(zip(ref_cols, tgt_cols)):
-        if ref_col != tgt_col:
-            mismatched_positions.append({"position": idx, "reference": ref_col, "target": tgt_col})
-        if len(mismatched_positions) >= 10:
-            break
-    raise ValueError(
-        f"{context}: feature schema mismatch. "
-        f"missing_columns={missing[:10]}, extra_columns={extra[:10]}, "
-        f"mismatched_positions={mismatched_positions}"
-    )
-
-
-def _debug_lengths(*, context: str, **named_arrays: Any) -> dict[str, int | None]:
-    lengths: dict[str, int | None] = {}
-    for name, value in named_arrays.items():
-        if value is None:
-            lengths[name] = None
-            continue
-        try:
-            lengths[name] = int(len(value))
-        except TypeError:
-            arr = np.asarray(value)
-            lengths[name] = int(arr.shape[0]) if arr.ndim > 0 else None
-    print(f"[debug][lengths] context={context} lengths={lengths}")
-    return lengths
-
-
-def _assert_same_length_arrays(*, context: str, **named_arrays: Any) -> dict[str, int | None]:
-    lengths = _debug_lengths(context=context, **named_arrays)
-    concrete_lengths = {name: value for name, value in lengths.items() if value is not None}
-    if concrete_lengths:
-        expected = next(iter(concrete_lengths.values()))
-        mismatched = {name: value for name, value in concrete_lengths.items() if value != expected}
-        if mismatched:
-            raise ValueError(f"{context}: inconsistent lengths detected: {concrete_lengths}")
-    return lengths
-
-
-def _assert_1d_label_vector(arr: Any, *, name: str, context: str) -> np.ndarray:
-    arr_np = np.asarray(arr)
-    print(
-        "[debug][label_vector] "
-        f"context={context} name={name} python_type={type(arr).__name__} "
-        f"numpy_dtype={arr_np.dtype} ndim={arr_np.ndim} shape={arr_np.shape}"
-    )
-    if arr_np.ndim != 1:
-        raise ValueError(
-            f"{context}: invalid {name}; expected 1D hard-label vector but got "
-            f"python_type={type(arr).__name__}, dtype={arr_np.dtype}, ndim={arr_np.ndim}, shape={arr_np.shape}."
-        )
-    return arr_np
-
-
-def _assert_probability_payload(
-    arr: Any,
-    *,
-    name: str,
-    context: str,
-    expected_rows: int,
-) -> np.ndarray:
-    arr_np = np.asarray(arr)
-    print(
-        "[debug][probability_payload] "
-        f"context={context} name={name} python_type={type(arr).__name__} "
-        f"numpy_dtype={arr_np.dtype} ndim={arr_np.ndim} shape={arr_np.shape}"
-    )
-    if arr_np.ndim not in {1, 2}:
-        raise ValueError(
-            f"{context}: invalid {name}; expected probability payload with ndim 1 or 2 but got "
-            f"python_type={type(arr).__name__}, dtype={arr_np.dtype}, ndim={arr_np.ndim}, shape={arr_np.shape}."
-        )
-    row_count = int(arr_np.shape[0]) if arr_np.ndim >= 1 else 0
-    if row_count != int(expected_rows):
-        raise ValueError(
-            f"{context}: invalid {name}; expected_rows={expected_rows} but got "
-            f"dtype={arr_np.dtype}, ndim={arr_np.ndim}, shape={arr_np.shape}."
-        )
-    print(f"[debug][probability_payload_rank] context={context} name={name} rank={'1D' if arr_np.ndim == 1 else '2D'}")
-    return arr_np
-
-
-def _validate_two_stage_eval_bundle(
-    *,
-    y_true: pd.Series | np.ndarray | list[Any],
-    y_pred: np.ndarray | list[Any],
-    y_proba: np.ndarray | list[list[float]] | None = None,
-    sample_weight: np.ndarray | list[float] | None = None,
-    ids: pd.Series | np.ndarray | list[Any] | None = None,
-    split_name: str,
-    model_name: str,
-) -> dict[str, Any]:
-    context = f"[{model_name}] split_semantics='{split_name}'"
-    y_true_arr = _assert_1d_label_vector(y_true, name="y_true", context=context)
-    y_pred_arr = _assert_1d_label_vector(y_pred, name="y_pred", context=context)
-    y_proba_arr = (
-        None
-        if y_proba is None
-        else _assert_probability_payload(
-            y_proba,
-            name="y_proba",
-            context=context,
-            expected_rows=int(y_true_arr.shape[0]),
-        )
-    )
-    sample_weight_arr = None if sample_weight is None else np.asarray(sample_weight, dtype=float)
-    ids_arr = None if ids is None else np.asarray(ids, dtype=object)
-    lengths = _assert_same_length_arrays(
-        context=context,
-        y_true=y_true_arr,
-        y_pred=y_pred_arr,
-        sample_weight=sample_weight_arr,
-        ids=ids_arr,
-    )
-    return {
-        "y_true": pd.Series(y_true_arr),
-        "y_pred": np.asarray(y_pred_arr),
-        "y_proba": y_proba_arr,
-        "sample_weight": sample_weight_arr,
-        "ids": ids_arr,
-        "lengths": lengths,
-    }
-
-
-def _sanitize_lightgbm_feature_name(name: Any) -> str:
-    text = str(name).strip()
-    sanitized = re.sub(r"[^0-9A-Za-z_]+", "_", text)
-    sanitized = re.sub(r"_+", "_", sanitized).strip("_")
-    return sanitized or "feature"
-
-
-def _sanitize_lightgbm_feature_names(df: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, str]]:
-    sanitized_columns: list[str] = []
-    mapping: dict[str, str] = {}
-    used: dict[str, int] = {}
-    for original in list(df.columns):
-        base = _sanitize_lightgbm_feature_name(original)
-        candidate = base
-        suffix = 1
-        while candidate in used:
-            suffix += 1
-            candidate = f"{base}_{suffix}"
-        used[candidate] = 1
-        mapping[str(original)] = candidate
-        sanitized_columns.append(candidate)
-    out = df.copy()
-    out.columns = sanitized_columns
-    return out, mapping
-
-
-def _sanitize_lightgbm_feature_frames(
-    *,
-    frames: dict[str, pd.DataFrame],
-    model_name: str,
-    stage_name: str,
-) -> tuple[dict[str, pd.DataFrame], dict[str, Any]]:
-    if model_name != "lightgbm":
-        return frames, {"applied": False, "model": model_name, "stage": stage_name, "mapping": {}}
-    if not frames:
-        return frames, {"applied": False, "model": model_name, "stage": stage_name, "mapping": {}}
-    reference_name, reference_df = next(iter(frames.items()))
-    reference_columns = list(reference_df.columns)
-    _, mapping = _sanitize_lightgbm_feature_names(reference_df)
-    sanitized_columns = [mapping[str(original)] for original in reference_columns]
-    sanitized_frames: dict[str, pd.DataFrame] = {}
-    for frame_name, frame in frames.items():
-        validate_feature_schema(reference_df, frame, context=f"{stage_name}:{frame_name}:lightgbm_feature_name_schema")
-        renamed = frame.copy()
-        renamed.columns = sanitized_columns
-        sanitized_frames[frame_name] = renamed
-    print(
-        "[lightgbm][feature_names] "
-        f"model={model_name} stage={stage_name} reference_frame={reference_name} column_count={len(reference_columns)}"
-    )
-    return sanitized_frames, {
-        "applied": True,
-        "model": model_name,
-        "stage": stage_name,
-        "mapping": mapping,
-    }
-
-
-def _log_duplicate_feature_check(df: pd.DataFrame, *, context: str) -> None:
-    duplicates = _duplicate_columns(df)
-    if duplicates:
-        print(f"[v8] duplicate feature check: failed context={context} duplicates={duplicates}")
-        raise ValueError(f"{context}: duplicate feature columns detected: {duplicates}")
-    print(f"[v8] duplicate feature check: passed context={context}")
-
-
-def _mirror_root_artifacts_to_runtime(
-    output_dir: Path,
-    runtime_dir: Path,
-    model_candidates: list[str],
-) -> dict[str, str]:
-    runtime_dir.mkdir(parents=True, exist_ok=True)
-    mirrored: dict[str, str] = {}
-
-    static_files = (
-        "artifact_manifest.json",
-        "benchmark_summary.json",
-        "benchmark_summary.md",
-        "leaderboard.csv",
-        "summary.csv",
-        "metrics.json",
-        "predictions.csv",
-    )
-    for filename in static_files:
-        source = output_dir / filename
-        if source.exists():
-            destination = runtime_dir / filename
-            shutil.copy2(source, destination)
-            mirrored[filename] = str(destination)
-
-    for model_name in model_candidates:
-        cm_file = output_dir / f"confusion_matrix_{model_name}.png"
-        if cm_file.exists():
-            destination = runtime_dir / cm_file.name
-            shutil.copy2(cm_file, destination)
-            mirrored[cm_file.name] = str(destination)
-
-        cm_norm_file = output_dir / f"confusion_matrix_{model_name}_normalized.png"
-        if cm_norm_file.exists():
-            destination = runtime_dir / cm_norm_file.name
-            shutil.copy2(cm_norm_file, destination)
-            mirrored[cm_norm_file.name] = str(destination)
-
-    return mirrored
-
-
-def _persist_per_model_run_outputs(
-    output_dir: Path,
-    run_stamp: str,
-    model_results: dict[str, Any],
-    trained_models: dict[str, Any],
-    class_metadata: dict[str, Any],
-) -> dict[str, str]:
-    per_model_paths: dict[str, str] = {}
-    for model_name, payload in model_results.items():
-        if not isinstance(payload, dict) or "metrics" not in payload:
-            continue
-        artifacts = payload.get("artifacts", {})
-        if not isinstance(artifacts, dict):
-            artifacts = {}
-        model_dir = output_dir / f"run_{run_stamp}_{_safe_filename_token(model_name)}"
-        model_dir.mkdir(parents=True, exist_ok=True)
-
-        metrics_path = model_dir / "metrics.json"
-        metrics_path.write_text(json.dumps(payload.get("metrics", {}), indent=2), encoding="utf-8")
-
-        report_payload = artifacts.get("classification_report_test")
-        if report_payload is None and artifacts.get("y_true_test") is not None and artifacts.get("y_pred_test") is not None:
-            report_payload = classification_report(
-                artifacts.get("y_true_test"),
-                artifacts.get("y_pred_test"),
-                labels=artifacts.get("labels"),
-                output_dict=True,
-                zero_division=0,
-            )
-        if report_payload is not None:
-            report_path = model_dir / "classification_report.json"
-            report_path.write_text(json.dumps(report_payload, indent=2), encoding="utf-8")
-
-        cm = artifacts.get("confusion_matrix")
-        if cm is not None:
-            cm_df = pd.DataFrame(cm)
-            cm_df.to_csv(model_dir / "confusion_matrix.csv", index=False)
-
-        if artifacts.get("y_true_test") is not None:
-            prediction_df = _build_prediction_export_dataframe(
-                y_true=pd.Series(artifacts.get("y_true_test")),
-                y_pred=artifacts.get("y_pred_test"),
-                y_proba=artifacts.get("y_proba_test"),
-                labels=artifacts.get("labels"),
-                class_metadata=class_metadata,
-                extra_columns=artifacts.get("prediction_export_test"),
-            )
-            prediction_df.to_csv(model_dir / "predictions.csv", index=False)
-
-        for key, filename in (
-            ("stage1_metrics", "stage1_metrics.json"),
-            ("stage2_metrics", "stage2_metrics.json"),
-            ("two_stage_diagnostics", "two_stage_diagnostics.json"),
-            ("middle_band_diagnostics", "middle_band_diagnostics.json"),
-        ):
-            extra_payload = artifacts.get(key)
-            if isinstance(extra_payload, dict) and extra_payload:
-                (model_dir / filename).write_text(json.dumps(extra_payload, indent=2), encoding="utf-8")
-
-        threshold_rows = artifacts.get("threshold_tuning_results")
-        if threshold_rows:
-            threshold_df = pd.DataFrame(threshold_rows)
-            threshold_df.to_csv(model_dir / "threshold_tuning_results.csv", index=False)
-            threshold_df.to_csv(model_dir / "threshold_search_results.csv", index=False)
-        selected_threshold = artifacts.get("selected_threshold")
-        if isinstance(selected_threshold, dict) and selected_threshold:
-            (model_dir / "selected_threshold.json").write_text(json.dumps(selected_threshold, indent=2), encoding="utf-8")
-
-        cv_payload = payload.get("cv_results")
-        if isinstance(cv_payload, dict) and cv_payload:
-            (model_dir / "cv_results.json").write_text(json.dumps(cv_payload, indent=2), encoding="utf-8")
-
-        optuna_payload = payload.get("optuna_summary")
-        if isinstance(optuna_payload, dict) and optuna_payload:
-            (model_dir / "optuna_summary.json").write_text(json.dumps(optuna_payload, indent=2), encoding="utf-8")
-
-        trained_model = trained_models.get(model_name)
-        if trained_model is not None:
-            model_path = model_dir / "model.joblib"
-            joblib.dump(trained_model, model_path)
-
-        per_model_paths[f"run_{_safe_filename_token(model_name)}"] = str(model_dir)
-    return per_model_paths
-
-
-def _normalize_dataset_name(raw_name: str) -> str:
-    normalized = raw_name.strip().lower()
-    return DATASET_NAME_ALIASES.get(normalized, normalized)
-
-
-def _safe_filename_token(value: str) -> str:
-    return "".join(ch if ch.isalnum() or ch in {"_", "-"} else "_" for ch in value).strip("_").lower()
-
-
-def _metric_label_token(raw_label: str) -> str:
-    value = str(raw_label).strip().lower()
-    return "".join(ch if ch.isalnum() else "_" for ch in value).strip("_")
-
-
-def _resolve_decision_rule_config(
-    exp_cfg: dict[str, Any],
-    formulation: str,
-    two_stage_enabled: bool,
-    class_metadata: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    evaluation_cfg = exp_cfg.get("evaluation", {}) if isinstance(exp_cfg.get("evaluation", {}), dict) else {}
-    training_cfg = exp_cfg.get("training", {}) if isinstance(exp_cfg.get("training", {}), dict) else {}
-    inference_cfg = exp_cfg.get("inference", {}) if isinstance(exp_cfg.get("inference", {}), dict) else {}
-    multiclass_decision_cfg = (
-        inference_cfg.get("multiclass_decision", {})
-        if isinstance(inference_cfg.get("multiclass_decision", {}), dict)
-        else {}
-    )
-
-    training_mode = str(training_cfg.get("mode", "")).strip().lower()
-    requested_rule_legacy = str(
-        evaluation_cfg.get("decision_rule", training_cfg.get("decision_rule", "model_predict"))
-    ).strip().lower()
-    requested_strategy = str(multiclass_decision_cfg.get("strategy", "")).strip().lower()
-    if requested_strategy:
-        requested_rule = requested_strategy
-    elif training_mode in {"multiclass_argmax", "paper_multiclass_argmax"}:
-        requested_rule = "argmax"
-    else:
-        requested_rule = requested_rule_legacy
-
-    supported_rules = {"model_predict", "argmax", "enrolled_margin", "enrolled_middle_band", "enrolled_push"}
-    if requested_rule not in supported_rules:
-        raise ValueError(
-            "Unsupported decision rule strategy. Use evaluation.decision_rule in "
-            "{'model_predict','argmax'} or inference.multiclass_decision.strategy in "
-            "{'argmax','enrolled_margin','enrolled_middle_band','enrolled_push'} "
-            f"(got '{requested_rule}')."
-        )
-
-    label_indices = set()
-    if isinstance(class_metadata, dict):
-        raw_indices = class_metadata.get("class_indices", [])
-        if isinstance(raw_indices, list):
-            label_indices = {int(v) for v in raw_indices}
-
-    strategy_params: dict[str, Any] = {"strategy": requested_rule}
-    if requested_rule == "enrolled_margin":
-        if formulation != "three_class":
-            raise ValueError(
-                "inference.multiclass_decision.strategy='enrolled_margin' is only supported for "
-                "target_formulation='three_class'."
-            )
-        if label_indices and label_indices != {0, 1, 2}:
-            raise ValueError(
-                "strategy='enrolled_margin' requires class indices {0,1,2} "
-                "(dropout/enrolled/graduate) in class metadata."
-            )
-        margin_threshold_raw = multiclass_decision_cfg.get("enrolled_margin_threshold", 0.10)
-        margin_threshold = float(margin_threshold_raw)
-        if margin_threshold < 0.0 or margin_threshold > 1.0:
-            raise ValueError("inference.multiclass_decision.enrolled_margin_threshold must be within [0.0, 1.0].")
-        strategy_params["enrolled_margin_threshold"] = margin_threshold
-
-    if requested_rule == "enrolled_middle_band":
-        if formulation != "three_class":
-            raise ValueError(
-                "inference.multiclass_decision.strategy='enrolled_middle_band' is only supported for "
-                "target_formulation='three_class'."
-            )
-        if label_indices and label_indices != {0, 1, 2}:
-            raise ValueError(
-                "strategy='enrolled_middle_band' requires class indices {0,1,2} "
-                "(dropout/enrolled/graduate) in class metadata."
-            )
-        dropout_threshold_raw = multiclass_decision_cfg.get("dropout_threshold", 0.55)
-        graduate_threshold_raw = multiclass_decision_cfg.get("graduate_threshold", 0.55)
-        dropout_threshold = float(dropout_threshold_raw)
-        graduate_threshold = float(graduate_threshold_raw)
-        if dropout_threshold < 0.0 or dropout_threshold > 1.0:
-            raise ValueError("inference.multiclass_decision.dropout_threshold must be within [0.0, 1.0].")
-        if graduate_threshold < 0.0 or graduate_threshold > 1.0:
-            raise ValueError("inference.multiclass_decision.graduate_threshold must be within [0.0, 1.0].")
-        strategy_params["dropout_threshold"] = dropout_threshold
-        strategy_params["graduate_threshold"] = graduate_threshold
-
-        class_label_to_index = (
-            class_metadata.get("class_label_to_index", {})
-            if isinstance(class_metadata, dict) and isinstance(class_metadata.get("class_label_to_index", {}), dict)
-            else {}
-        )
-        canonical_label_lookup = {str(key).strip().lower(): int(value) for key, value in class_label_to_index.items()}
-
-        def _resolve_named_label(raw_value: Any, *, field_name: str, default_index: int) -> int:
-            if raw_value is None:
-                return int(default_index)
-            token = str(raw_value).strip()
-            if not token:
-                return int(default_index)
-            if token.lstrip("-").isdigit():
-                return int(token)
-            resolved = canonical_label_lookup.get(token.lower())
-            if resolved is None:
-                raise ValueError(
-                    f"inference.multiclass_decision.enrolled_decision_tuning.{field_name} "
-                    f"must match a mapped class label or class index (got {raw_value!r})."
-                )
-            return int(resolved)
-
-        tuning_raw = multiclass_decision_cfg.get("enrolled_decision_tuning", {})
-        if not isinstance(tuning_raw, dict):
-            tuning_raw = {}
-        tuning_enabled = bool(tuning_raw.get("enabled", False))
-        tuning_payload: dict[str, Any] = {"enabled": tuning_enabled}
-        if tuning_enabled:
-            enrolled_label = _resolve_named_label(
-                tuning_raw.get("enrolled_label", "Enrolled"),
-                field_name="enrolled_label",
-                default_index=1,
-            )
-            dropout_label = _resolve_named_label(
-                tuning_raw.get("dropout_label", "Dropout"),
-                field_name="dropout_label",
-                default_index=0,
-            )
-            graduate_label = _resolve_named_label(
-                tuning_raw.get("graduate_label", "Graduate"),
-                field_name="graduate_label",
-                default_index=2,
-            )
-            if len({enrolled_label, dropout_label, graduate_label}) != 3:
-                raise ValueError(
-                    "inference.multiclass_decision.enrolled_decision_tuning labels must resolve to three distinct classes."
-                )
-
-            enrolled_min_proba = float(tuning_raw.get("enrolled_min_proba", 0.30))
-            enrolled_margin_gap = float(tuning_raw.get("enrolled_margin_gap", 0.08))
-            ambiguity_max_gap = float(tuning_raw.get("ambiguity_max_gap", 0.12))
-            high_confidence_guard = float(tuning_raw.get("high_confidence_guard", 0.62))
-            graduate_guard_max = float(tuning_raw.get("graduate_guard_max", 0.62))
-            dropout_guard_max = float(tuning_raw.get("dropout_guard_max", 0.62))
-
-            for field_name, value in [
-                ("enrolled_min_proba", enrolled_min_proba),
-                ("enrolled_margin_gap", enrolled_margin_gap),
-                ("ambiguity_max_gap", ambiguity_max_gap),
-                ("high_confidence_guard", high_confidence_guard),
-                ("graduate_guard_max", graduate_guard_max),
-                ("dropout_guard_max", dropout_guard_max),
-            ]:
-                if value < 0.0 or value > 1.0:
-                    raise ValueError(
-                        f"inference.multiclass_decision.enrolled_decision_tuning.{field_name} must be within [0.0, 1.0]."
-                    )
-
-            tuning_payload.update(
-                {
-                    "enabled": True,
-                    "enrolled_label": int(enrolled_label),
-                    "dropout_label": int(dropout_label),
-                    "graduate_label": int(graduate_label),
-                    "enrolled_min_proba": float(enrolled_min_proba),
-                    "enrolled_margin_gap": float(enrolled_margin_gap),
-                    "ambiguity_max_gap": float(ambiguity_max_gap),
-                    "high_confidence_guard": float(high_confidence_guard),
-                    "graduate_guard_max": float(graduate_guard_max),
-                    "dropout_guard_max": float(dropout_guard_max),
-                    "require_enrolled_above_baseline": bool(tuning_raw.get("require_enrolled_above_baseline", True)),
-                }
-            )
-        strategy_params["enrolled_decision_tuning"] = tuning_payload
-
-    if requested_rule == "enrolled_push":
-        if formulation != "three_class":
-            raise ValueError(
-                "inference.multiclass_decision.strategy='enrolled_push' is only supported for "
-                "target_formulation='three_class'."
-            )
-        if label_indices and label_indices != {0, 1, 2}:
-            raise ValueError(
-                "strategy='enrolled_push' requires class indices {0,1,2} "
-                "(dropout/enrolled/graduate) in class metadata."
-            )
-        enrolled_class_name = str(multiclass_decision_cfg.get("enrolled_class_name", "Enrolled")).strip() or "Enrolled"
-        threshold_block = multiclass_decision_cfg.get("enrolled_probability_threshold", {})
-        if not isinstance(threshold_block, dict):
-            threshold_block = {"enabled": threshold_block is not None, "value": threshold_block}
-        threshold_enabled = bool(threshold_block.get("enabled", False))
-        threshold_value_raw = threshold_block.get("value", threshold_block.get("threshold", 0.40))
-        threshold_payload: dict[str, Any] = {"enabled": threshold_enabled}
-        if threshold_enabled:
-            threshold_value = float(threshold_value_raw)
-            if threshold_value < 0.0 or threshold_value > 1.0:
-                raise ValueError("inference.multiclass_decision.enrolled_probability_threshold must be within [0.0, 1.0].")
-            threshold_payload["value"] = threshold_value
-
-        middle_band_raw = multiclass_decision_cfg.get("enrolled_middle_band", {})
-        if not isinstance(middle_band_raw, dict):
-            middle_band_raw = {}
-        middle_band_enabled = bool(middle_band_raw.get("enabled", False))
-        middle_band_payload: dict[str, Any] = {"enabled": middle_band_enabled}
-        if middle_band_enabled:
-            min_prob = float(middle_band_raw.get("min_enrolled_prob", 0.30))
-            max_gap = float(middle_band_raw.get("max_top2_gap", 0.05))
-            if min_prob < 0.0 or min_prob > 1.0:
-                raise ValueError("inference.multiclass_decision.enrolled_middle_band.min_enrolled_prob must be within [0.0, 1.0].")
-            if max_gap < 0.0 or max_gap > 1.0:
-                raise ValueError("inference.multiclass_decision.enrolled_middle_band.max_top2_gap must be within [0.0, 1.0].")
-            middle_band_payload.update(
-                {
-                    "min_enrolled_prob": min_prob,
-                    "max_top2_gap": max_gap,
-                }
-            )
-        strategy_params.update(
-            {
-                "enrolled_class_name": enrolled_class_name,
-                "fallback": str(multiclass_decision_cfg.get("fallback", "argmax")).strip().lower() or "argmax",
-                "enrolled_probability_threshold": threshold_payload,
-                "enrolled_middle_band": middle_band_payload,
-            }
-        )
-
-    if requested_rule == "argmax":
-        # Always keep strategy payload explicit for downstream auditing and summaries.
-        strategy_params = {"strategy": "argmax"}
-    if requested_rule == "model_predict":
-        strategy_params = {"strategy": "model_predict"}
-
-    auto_tune_cfg_raw = multiclass_decision_cfg.get("auto_tune", {})
-    auto_tune_cfg = auto_tune_cfg_raw if isinstance(auto_tune_cfg_raw, dict) else {}
-    auto_tune_enabled = bool(auto_tune_cfg.get("enabled", False))
-    if auto_tune_enabled:
-        if requested_rule not in {"enrolled_margin", "enrolled_middle_band", "enrolled_push"}:
-            raise ValueError(
-                "inference.multiclass_decision.auto_tune.enabled=true is only supported for "
-                "strategies {'enrolled_margin','enrolled_middle_band','enrolled_push'}."
-            )
-        objective = str(auto_tune_cfg.get("objective", "macro_f1")).strip().lower()
-        if objective not in {"macro_f1", "enrolled_f1", "enrolled_recall", "balanced_accuracy"}:
-            raise ValueError(
-                "inference.multiclass_decision.auto_tune.objective must be one of "
-                "{'macro_f1','enrolled_f1','enrolled_recall','balanced_accuracy'}."
-            )
-        split_name = str(auto_tune_cfg.get("split", "validation")).strip().lower()
-        if split_name != "validation":
-            raise ValueError("inference.multiclass_decision.auto_tune.split must be 'validation'.")
-        search_cfg = auto_tune_cfg.get("search", {}) if isinstance(auto_tune_cfg.get("search", {}), dict) else {}
-        search_method = str(search_cfg.get("method", "grid")).strip().lower()
-        if search_method != "grid":
-            raise ValueError("inference.multiclass_decision.auto_tune.search.method must be 'grid'.")
-        if requested_rule == "enrolled_margin":
-            grid_vals = search_cfg.get("enrolled_margin_thresholds", [])
-            if not isinstance(grid_vals, list) or len(grid_vals) == 0:
-                raise ValueError(
-                    "inference.multiclass_decision.auto_tune.search.enrolled_margin_thresholds "
-                    "must be a non-empty list."
-                )
-            for raw in grid_vals:
-                val = float(raw)
-                if val < 0.0 or val > 1.0:
-                    raise ValueError("enrolled_margin_threshold search values must be within [0.0, 1.0].")
-        if requested_rule == "enrolled_middle_band":
-            drop_vals = search_cfg.get("dropout_thresholds", [])
-            grad_vals = search_cfg.get("graduate_thresholds", [])
-            if not isinstance(drop_vals, list) or len(drop_vals) == 0:
-                raise ValueError(
-                    "inference.multiclass_decision.auto_tune.search.dropout_thresholds must be a non-empty list."
-                )
-            if not isinstance(grad_vals, list) or len(grad_vals) == 0:
-                raise ValueError(
-                    "inference.multiclass_decision.auto_tune.search.graduate_thresholds must be a non-empty list."
-                )
-            for raw in [*drop_vals, *grad_vals]:
-                val = float(raw)
-                if val < 0.0 or val > 1.0:
-                    raise ValueError("middle-band search threshold values must be within [0.0, 1.0].")
-        if requested_rule == "enrolled_push":
-            threshold_cfg = strategy_params.get("enrolled_probability_threshold", {})
-            middle_band_cfg = strategy_params.get("enrolled_middle_band", {})
-            if bool(threshold_cfg.get("enabled", False)):
-                threshold_search = search_cfg.get("enrolled_probability_thresholds", [])
-                if not isinstance(threshold_search, list) or len(threshold_search) == 0:
-                    raise ValueError(
-                        "inference.multiclass_decision.auto_tune.search.enrolled_probability_thresholds "
-                        "must be a non-empty list when enrolled_probability_threshold is enabled."
-                    )
-                for raw in threshold_search:
-                    val = float(raw)
-                    if val < 0.0 or val > 1.0:
-                        raise ValueError("enrolled_probability_threshold search values must be within [0.0, 1.0].")
-            if bool(middle_band_cfg.get("enabled", False)):
-                min_prob_search = search_cfg.get("min_enrolled_probs", [])
-                max_gap_search = search_cfg.get("max_top2_gaps", [])
-                if not isinstance(min_prob_search, list) or len(min_prob_search) == 0:
-                    raise ValueError(
-                        "inference.multiclass_decision.auto_tune.search.min_enrolled_probs must be a non-empty list "
-                        "when enrolled_middle_band is enabled."
-                    )
-                if not isinstance(max_gap_search, list) or len(max_gap_search) == 0:
-                    raise ValueError(
-                        "inference.multiclass_decision.auto_tune.search.max_top2_gaps must be a non-empty list "
-                        "when enrolled_middle_band is enabled."
-                    )
-                for raw in [*min_prob_search, *max_gap_search]:
-                    val = float(raw)
-                    if val < 0.0 or val > 1.0:
-                        raise ValueError("enrolled_push middle-band search values must be within [0.0, 1.0].")
-        strategy_params["auto_tune"] = {
-            "enabled": True,
-            "objective": objective,
-            "split": split_name,
-            "search": {
-                **search_cfg,
-                "method": "grid",
-            },
-        }
-    else:
-        strategy_params["auto_tune"] = {"enabled": False}
-
-    if two_stage_enabled and requested_rule != "model_predict":
-        return {
-            "decision_rule": "model_predict",
-            "requested_decision_rule": requested_rule,
-            "requested_decision_rule_legacy": requested_rule_legacy,
-            "multiclass_decision": {"strategy": "model_predict"},
-            "overridden_reason": "two_stage_runner_controls_decision_logic",
-            "training_mode": training_mode,
-            "target_formulation": formulation,
-        }
-    return {
-        "decision_rule": requested_rule,
-        "requested_decision_rule": requested_rule,
-        "requested_decision_rule_legacy": requested_rule_legacy,
-        "multiclass_decision": strategy_params,
-        "overridden_reason": None,
-        "training_mode": training_mode,
-        "target_formulation": formulation,
-    }
-
-
-def _resolve_cv_reporting_config(
-    exp_cfg: dict[str, Any],
-    seed: int,
-    paper_reproduction_mode: bool,
-) -> dict[str, Any]:
-    evaluation_cfg = exp_cfg.get("evaluation", {}) if isinstance(exp_cfg.get("evaluation", {}), dict) else {}
-    cv_cfg = evaluation_cfg.get("cross_validation", {})
-    if not isinstance(cv_cfg, dict):
-        cv_cfg = {}
-
-    enabled = bool(cv_cfg.get("enabled", False))
-    if paper_reproduction_mode:
-        enabled = True
-
-    n_splits = int(cv_cfg.get("n_splits", cv_cfg.get("folds", 5)))
-    n_splits = max(2, n_splits)
-    shuffle = bool(cv_cfg.get("shuffle", True))
-    random_state = int(cv_cfg.get("random_state", seed))
-
-    return {
-        "enabled": enabled,
-        "n_splits": n_splits,
-        "shuffle": shuffle,
-        "random_state": random_state,
-        "optuna_objective_metric": "cv_macro_f1_mean",
-    }
-
-
-def _resolve_model_selection_config(exp_cfg: dict[str, Any]) -> dict[str, Any]:
-    raw_cfg = exp_cfg.get("selection", {}) if isinstance(exp_cfg.get("selection", {}), dict) else {}
-    enabled = bool(raw_cfg)
-    primary = str(raw_cfg.get("primary", "macro_f1")).strip()
-    secondary = str(raw_cfg.get("secondary", "balanced_accuracy")).strip()
-    tertiary = str(raw_cfg.get("tertiary", "accuracy")).strip()
-    tie_breakers_raw = raw_cfg.get("tie_breakers", [])
-    tie_breakers: list[str] = []
-    if isinstance(tie_breakers_raw, list):
-        tie_breakers = [str(metric).strip() for metric in tie_breakers_raw if str(metric).strip()]
-    ranking_metrics = [metric for metric in [primary or "macro_f1", *tie_breakers] if metric]
-    if len(ranking_metrics) == 1:
-        for fallback in [secondary or "balanced_accuracy", tertiary or "accuracy"]:
-            if fallback and fallback not in ranking_metrics:
-                ranking_metrics.append(fallback)
-    return {
-        "enabled": enabled,
-        "primary": primary or "macro_f1",
-        "secondary": secondary or "balanced_accuracy",
-        "tertiary": tertiary or "accuracy",
-        "tie_breakers": tie_breakers,
-        "ranking_metrics": ranking_metrics,
-    }
-
-
-def _resolve_experiment_feature_config(
-    exp_cfg: dict[str, Any],
-    dataset_cfg: dict[str, Any],
-) -> dict[str, Any]:
-    resolved = copy.deepcopy(dataset_cfg)
-    experiment_feature_cfg = (
-        exp_cfg.get("feature_engineering", {})
-        if isinstance(exp_cfg.get("feature_engineering", {}), dict)
-        else {}
-    )
-    if not experiment_feature_cfg:
-        return resolved
-    dataset_feature_overrides = (
-        experiment_feature_cfg.get("dataset_features", {})
-        if isinstance(experiment_feature_cfg.get("dataset_features", {}), dict)
-        else {}
-    )
-    if dataset_feature_overrides:
-        resolved["features"] = _deep_merge_dicts(
-            resolved.get("features", {}) if isinstance(resolved.get("features", {}), dict) else {},
-            dataset_feature_overrides,
-        )
-    return resolved
-
-
-def _resolve_two_stage_stage2_feature_sharpening_config(two_stage_cfg: dict[str, Any]) -> dict[str, Any]:
-    stage2_cfg = two_stage_cfg.get("stage2", {}) if isinstance(two_stage_cfg.get("stage2", {}), dict) else {}
-    raw_cfg = (
-        stage2_cfg.get("feature_sharpening", {})
-        if isinstance(stage2_cfg.get("feature_sharpening", {}), dict)
-        else {}
-    )
-    enabled = bool(raw_cfg.get("enabled", False))
-    raw_groups = raw_cfg.get("groups", [])
-    groups: list[str] = []
-    if isinstance(raw_groups, list):
-        for item in raw_groups:
-            group = str(item).strip().lower()
-            if group and group not in groups:
-                groups.append(group)
-    if enabled and not groups:
-        groups = list(DEFAULT_STAGE2_FEATURE_GROUPS)
-    return {
-        "enabled": enabled,
-        "groups": groups,
-        "default_groups": list(DEFAULT_STAGE2_FEATURE_GROUPS),
-    }
-
-
-def _resolve_two_stage_stage2_advanced_config(two_stage_cfg: dict[str, Any]) -> dict[str, Any]:
-    stage2_cfg = two_stage_cfg.get("stage2", {}) if isinstance(two_stage_cfg.get("stage2", {}), dict) else {}
-    raw_cfg = (
-        stage2_cfg.get("advanced_enrolled_separation", {})
-        if isinstance(stage2_cfg.get("advanced_enrolled_separation", {}), dict)
-        else {}
-    )
-    enabled = bool(raw_cfg.get("enabled", False))
-
-    interaction_raw = (
-        raw_cfg.get("interaction_features", {})
-        if isinstance(raw_cfg.get("interaction_features", {}), dict)
-        else {}
-    )
-    interaction_enabled = enabled and bool(interaction_raw.get("enabled", False))
-    interaction_groups: list[str] = []
-    if isinstance(interaction_raw.get("groups", []), list):
-        for item in interaction_raw.get("groups", []):
-            group = str(item).strip().lower()
-            if group and group not in interaction_groups:
-                interaction_groups.append(group)
-    if interaction_enabled and not interaction_groups:
-        interaction_groups = list(DEFAULT_INTERACTION_GROUPS)
-
-    prototype_raw = (
-        raw_cfg.get("prototype_distance", {})
-        if isinstance(raw_cfg.get("prototype_distance", {}), dict)
-        else {}
-    )
-    stage2_robust_prototype_raw = (
-        stage2_cfg.get("robust_prototypes", {})
-        if isinstance(stage2_cfg.get("robust_prototypes", {}), dict)
-        else {}
-    )
-    if stage2_robust_prototype_raw:
-        enabled = True
-        prototype_raw = stage2_robust_prototype_raw
-    prototype_enabled = enabled and bool(prototype_raw.get("enabled", False))
-    prototype_metric_set: list[str] = []
-    if isinstance(prototype_raw.get("metric_set", []), list):
-        for item in prototype_raw.get("metric_set", []):
-            metric = str(item).strip().lower()
-            if metric and metric not in prototype_metric_set:
-                prototype_metric_set.append(metric)
-    if prototype_enabled and not prototype_metric_set and not stage2_robust_prototype_raw:
-        prototype_metric_set = list(DEFAULT_PROTOTYPE_METRIC_SET)
-
-    return {
-        "enabled": enabled,
-        "interaction_features": {
-            "enabled": interaction_enabled,
-            "groups": interaction_groups,
-            "default_groups": list(DEFAULT_INTERACTION_GROUPS),
-        },
-        "prototype_distance": {
-            "enabled": prototype_enabled,
-            "metric_set": prototype_metric_set,
-            "default_metric_set": list(DEFAULT_PROTOTYPE_METRIC_SET),
-        },
-    }
-
-
-def _resolve_two_stage_stage2_selective_interactions_config(two_stage_cfg: dict[str, Any]) -> dict[str, Any]:
-    stage2_cfg = two_stage_cfg.get("stage2", {}) if isinstance(two_stage_cfg.get("stage2", {}), dict) else {}
-    raw_cfg = (
-        stage2_cfg.get("selective_interactions", {})
-        if isinstance(stage2_cfg.get("selective_interactions", {}), dict)
-        else {}
-    )
-    allowlist: list[str] = []
-    if isinstance(raw_cfg.get("feature_allowlist", []), list):
-        for item in raw_cfg.get("feature_allowlist", []):
-            feature_name = str(item).strip().lower()
-            if feature_name and feature_name not in allowlist:
-                allowlist.append(feature_name)
-    return {
-        "enabled": bool(raw_cfg.get("enabled", False)),
-        "feature_allowlist": allowlist,
-    }
-
-
-def _resolve_two_stage_stage2_finite_sanitation_config(two_stage_cfg: dict[str, Any]) -> dict[str, Any]:
-    stage2_cfg = two_stage_cfg.get("stage2", {}) if isinstance(two_stage_cfg.get("stage2", {}), dict) else {}
-    raw_cfg = (
-        stage2_cfg.get("finite_sanitation", {})
-        if isinstance(stage2_cfg.get("finite_sanitation", {}), dict)
-        else {}
-    )
-    return {
-        "enabled": bool(raw_cfg.get("enabled", False)),
-        "replace_inf": bool(raw_cfg.get("replace_inf", True)),
-        "impute_missing": bool(raw_cfg.get("impute_missing", True)),
-        "fail_if_non_finite_after_impute": bool(raw_cfg.get("fail_if_non_finite_after_impute", True)),
-        "strategy": str(raw_cfg.get("strategy", "median")).strip().lower(),
-    }
-
-
-def _resolve_global_balance_guard_config(exp_cfg: dict[str, Any]) -> dict[str, Any]:
-    evaluation_cfg = exp_cfg.get("evaluation", {}) if isinstance(exp_cfg.get("evaluation", {}), dict) else {}
-    raw_cfg = (
-        evaluation_cfg.get("global_balance_guard", {})
-        if isinstance(evaluation_cfg.get("global_balance_guard", {}), dict)
-        else {}
-    )
-    return {
-        "enabled": bool(raw_cfg.get("enabled", False)),
-        "reference_source": str(raw_cfg.get("reference_source", "baseline_stage2")).strip().lower(),
-        "max_graduate_f1_drop": None if raw_cfg.get("max_graduate_f1_drop") is None else float(raw_cfg.get("max_graduate_f1_drop")),
-        "min_macro_f1": None if raw_cfg.get("min_macro_f1") is None else float(raw_cfg.get("min_macro_f1")),
-        "min_graduate_f1": None if raw_cfg.get("min_graduate_f1") is None else float(raw_cfg.get("min_graduate_f1")),
-        "penalty_weight": float(raw_cfg.get("penalty_weight", 0.5)),
-        "fallback_to_plain_macro_f1_if_no_candidate_passes": bool(
-            raw_cfg.get("fallback_to_plain_macro_f1_if_no_candidate_passes", True)
-        ),
-    }
-
-
-def validate_and_sanitize_feature_matrix(
-    X_train: pd.DataFrame,
-    X_valid: pd.DataFrame,
-    X_test: pd.DataFrame,
-    *,
-    model_name: str,
-    feature_stage: str,
-    sanitation_cfg: dict[str, Any] | None = None,
-    extra_frames: dict[str, pd.DataFrame] | None = None,
-) -> tuple[dict[str, pd.DataFrame], dict[str, Any]]:
-    cfg = sanitation_cfg if isinstance(sanitation_cfg, dict) else {"enabled": False}
-    frame_payload = {
-        "train": X_train.copy(),
-        "valid": X_valid.copy(),
-        "test": X_test.copy(),
-    }
-    if isinstance(extra_frames, dict):
-        for frame_name, frame in extra_frames.items():
-            if isinstance(frame, pd.DataFrame):
-                frame_payload[frame_name] = frame.copy()
-
-    report: dict[str, Any] = {
-        "enabled": bool(cfg.get("enabled", False)),
-        "model": model_name,
-        "feature_stage": feature_stage,
-        "replace_inf": bool(cfg.get("replace_inf", True)),
-        "imputation_applied": False,
-        "pre_sanitize_nan_count": {},
-        "pre_sanitize_inf_count": {},
-        "final_finite_check": {},
-    }
-    if not bool(cfg.get("enabled", False)):
-        return frame_payload, report
-
-    processed: dict[str, pd.DataFrame] = {}
-    for frame_name, frame in frame_payload.items():
-        numeric_frame = frame.apply(pd.to_numeric, errors="coerce")
-        inf_mask = np.isinf(numeric_frame.to_numpy(dtype=float))
-        report["pre_sanitize_inf_count"][frame_name] = int(inf_mask.sum())
-        if bool(cfg.get("replace_inf", True)):
-            numeric_frame = numeric_frame.replace([np.inf, -np.inf], np.nan)
-        report["pre_sanitize_nan_count"][frame_name] = int(numeric_frame.isna().sum().sum())
-        processed[frame_name] = numeric_frame
-
-    if bool(cfg.get("impute_missing", True)):
-        imputer = SimpleImputer(strategy=str(cfg.get("strategy", "median") or "median"))
-        imputer.fit(processed["train"])
-        report["imputation_applied"] = True
-        for frame_name, frame in processed.items():
-            processed[frame_name] = pd.DataFrame(
-                imputer.transform(frame),
-                columns=frame.columns,
-                index=frame.index,
-            )
-
-    for frame_name, frame in processed.items():
-        finite_ok = bool(np.isfinite(frame.to_numpy(dtype=float)).all())
-        report["final_finite_check"][frame_name] = finite_ok
-        if not finite_ok and bool(cfg.get("fail_if_non_finite_after_impute", True)):
-            raise ValueError(
-                f"[{model_name}] non-finite values remain after sanitation at {feature_stage} for split='{frame_name}'."
-            )
-
-    print(f"[v8] pre-sanitize NaN count: {report['pre_sanitize_nan_count']} model={model_name} stage={feature_stage}")
-    print(f"[v8] pre-sanitize Inf count: {report['pre_sanitize_inf_count']} model={model_name} stage={feature_stage}")
-    print(f"[v8] imputation applied: {report['imputation_applied']} model={model_name} stage={feature_stage}")
-    print(f"[v8] post-sanitize finite check: {report['final_finite_check']} model={model_name} stage={feature_stage}")
-    return processed, report
-
-
-def _apply_global_balance_guard(
-    leaderboard_df: pd.DataFrame,
-    *,
-    guard_cfg: dict[str, Any],
-) -> tuple[pd.DataFrame, dict[str, Any]]:
-    report: dict[str, Any] = {
-        "enabled": bool(guard_cfg.get("enabled", False)),
-        "reference_source": guard_cfg.get("reference_source"),
-        "reference_metrics": {},
-        "fallback_used": False,
-        "candidate_decisions": [],
-    }
-    if leaderboard_df.empty or not bool(guard_cfg.get("enabled", False)):
-        return leaderboard_df, report
-
-    required_cols = {"test_macro_f1", "test_f1_enrolled", "test_f1_graduate"}
-    if not required_cols.issubset(set(leaderboard_df.columns)):
-        report["fallback_used"] = True
-        report["fallback_reason"] = "missing_required_columns"
-        print("[v8] fallback to unguarded selection because missing guard columns in leaderboard.")
-        return leaderboard_df, report
-
-    ranked_plain = leaderboard_df.copy()
-    for col in required_cols:
-        ranked_plain[col] = pd.to_numeric(ranked_plain[col], errors="coerce")
-    plain_sort_cols = [col for col in ["test_macro_f1", "test_balanced_accuracy", "test_accuracy"] if col in ranked_plain.columns]
-    ranked_plain = ranked_plain.sort_values(
-        [*plain_sort_cols, "model"],
-        ascending=[False] * len(plain_sort_cols) + [True],
-        na_position="last",
-    ).reset_index(drop=True)
-    if ranked_plain.empty:
-        return leaderboard_df, report
-
-    reference_row = ranked_plain.iloc[0]
-    reference_metrics = {
-        "model": str(reference_row["model"]),
-        "macro_f1": float(reference_row.get("test_macro_f1", np.nan)),
-        "enrolled_f1": float(reference_row.get("test_f1_enrolled", np.nan)),
-        "graduate_f1": float(reference_row.get("test_f1_graduate", np.nan)),
-        "dropout_f1": float(reference_row.get("test_f1_dropout", np.nan)) if "test_f1_dropout" in ranked_plain.columns else np.nan,
-    }
-    report["reference_metrics"] = reference_metrics
-
-    guarded = ranked_plain.copy()
-    guarded["guard_selection_score"] = guarded["test_macro_f1"].astype(float)
-    guarded["guard_pass"] = True
-    max_drop = guard_cfg.get("max_graduate_f1_drop")
-    min_macro = guard_cfg.get("min_macro_f1")
-    min_grad = guard_cfg.get("min_graduate_f1")
-    penalty_weight = float(guard_cfg.get("penalty_weight", 0.5))
-
-    for idx, row in guarded.iterrows():
-        enrolled_delta = float(row["test_f1_enrolled"] - reference_metrics["enrolled_f1"])
-        graduate_delta = float(row["test_f1_graduate"] - reference_metrics["graduate_f1"])
-        dropout_delta = (
-            float(row["test_f1_dropout"] - reference_metrics["dropout_f1"])
-            if "test_f1_dropout" in guarded.columns and np.isfinite(reference_metrics["dropout_f1"])
-            else float("nan")
-        )
-        macro_f1 = float(row["test_macro_f1"])
-        graduate_f1 = float(row["test_f1_graduate"])
-        violations: list[str] = []
-        if min_macro is not None and macro_f1 < float(min_macro):
-            violations.append("macro_floor")
-        if min_grad is not None and graduate_f1 < float(min_grad):
-            violations.append("graduate_floor")
-        if max_drop is not None and enrolled_delta > 0.0 and graduate_delta < -float(max_drop):
-            violations.append("graduate_drop_exceeded")
-        penalty = penalty_weight * max(0.0, -(graduate_delta + float(max_drop or 0.0))) if "graduate_drop_exceeded" in violations else 0.0
-        guarded.at[idx, "guard_selection_score"] = macro_f1 - penalty
-        guarded.at[idx, "guard_pass"] = len(violations) == 0
-        decision = {
-            "model": str(row["model"]),
-            "enrolled_f1_delta": enrolled_delta,
-            "graduate_f1_delta": graduate_delta,
-            "dropout_f1_delta": dropout_delta,
-            "guard_pass": bool(len(violations) == 0),
-            "guarded_selection_score": float(guarded.at[idx, "guard_selection_score"]),
-            "violations": violations,
-        }
-        report["candidate_decisions"].append(decision)
-        print(
-            "[v8] guard metrics: "
-            f"model={decision['model']} enrolled_f1={float(row['test_f1_enrolled']):.4f} "
-            f"graduate_f1={graduate_f1:.4f} macro_f1={macro_f1:.4f} "
-            f"delta_enrolled={enrolled_delta:+.4f} delta_graduate={graduate_delta:+.4f} "
-            f"delta_dropout={dropout_delta:+.4f}"
-        )
-        print(
-            f"[v8] guard decision: model={decision['model']} "
-            f"{'pass' if decision['guard_pass'] else 'fail'} score={decision['guarded_selection_score']:.4f} "
-            f"violations={violations}"
-        )
-
-    passing = guarded[guarded["guard_pass"] == True].copy()
-    if passing.empty and bool(guard_cfg.get("fallback_to_plain_macro_f1_if_no_candidate_passes", True)):
-        report["fallback_used"] = True
-        report["fallback_reason"] = "no_candidate_passed_guard"
-        print("[v8] fallback to unguarded selection because no candidate passed the global balance guard.")
-        return ranked_plain, report
-
-    ranked_output = passing if not passing.empty else guarded
-    guard_sort_cols = [col for col in ["guard_selection_score", "test_macro_f1", "test_balanced_accuracy", "test_accuracy"] if col in ranked_output.columns]
-    ranked_output = ranked_output.sort_values(
-        [*guard_sort_cols, "model"],
-        ascending=[False] * len(guard_sort_cols) + [True],
-        na_position="last",
-    ).reset_index(drop=True)
-    return ranked_output, report
-
-
-def _prepare_two_stage_stage2_feature_bundle(
-    *,
-    two_stage_cfg: dict[str, Any],
-    splits: dict[str, pd.DataFrame],
-    preprocess_cfg: dict[str, Any],
-) -> dict[str, Any]:
-    feature_cfg = _resolve_two_stage_stage2_feature_sharpening_config(two_stage_cfg)
-    advanced_cfg = _resolve_two_stage_stage2_advanced_config(two_stage_cfg)
-    selective_cfg = _resolve_two_stage_stage2_selective_interactions_config(two_stage_cfg)
-    requested_groups = list(feature_cfg.get("groups", []))
-    interaction_cfg = advanced_cfg.get("interaction_features", {})
-    prototype_cfg = advanced_cfg.get("prototype_distance", {})
-    requested_interaction_groups = list(interaction_cfg.get("groups", [])) if isinstance(interaction_cfg, dict) else []
-    selective_allowlist = list(selective_cfg.get("feature_allowlist", []))
-    print(
-        "[two_stage][stage2][feature_sharpening] "
-        f"enabled={bool(feature_cfg.get('enabled', False))} "
-        f"requested_groups={requested_groups if requested_groups else []}"
-    )
-    print(
-        "[two_stage][stage2][advanced_enrolled_separation] "
-        f"enabled={bool(advanced_cfg.get('enabled', False))} "
-        f"interaction_enabled={bool(interaction_cfg.get('enabled', False))} "
-        f"interaction_groups={requested_interaction_groups if requested_interaction_groups else []} "
-        f"prototype_distance_enabled={bool(prototype_cfg.get('enabled', False))} "
-        f"prototype_metric_set={list(prototype_cfg.get('metric_set', [])) if isinstance(prototype_cfg, dict) else []}"
-    )
-    print(
-        "[two_stage][stage2][selective_interactions] "
-        f"enabled={bool(selective_cfg.get('enabled', False))} "
-        f"feature_allowlist={selective_allowlist if selective_allowlist else []}"
-    )
-    if not bool(feature_cfg.get("enabled", False)) and not bool(interaction_cfg.get("enabled", False)) and not bool(selective_cfg.get("enabled", False)):
-        return {
-            "enabled": False,
-            "requested_groups": requested_groups,
-            "advanced_requested_groups": requested_interaction_groups,
-            "selective_feature_allowlist": selective_allowlist,
-            "report": {
-                "enabled": False,
-                "requested_groups": requested_groups,
-                "advanced_enrolled_separation_enabled": bool(advanced_cfg.get("enabled", False)),
-                "interaction_features_enabled": bool(interaction_cfg.get("enabled", False)),
-                "prototype_distance_enabled": bool(prototype_cfg.get("enabled", False)),
-                "interaction_requested_groups": requested_interaction_groups,
-                "selective_interactions_enabled": bool(selective_cfg.get("enabled", False)),
-                "selective_feature_allowlist": selective_allowlist,
-                "prototype_metric_set": list(prototype_cfg.get("metric_set", [])) if isinstance(prototype_cfg, dict) else [],
-                "default_groups": list(feature_cfg.get("default_groups", [])),
-                "created_features": [],
-                "created_feature_count": 0,
-                "created_features_by_group": {},
-                "skipped_features_by_group": {},
-                "feature_sharpening": {"enabled": False},
-                "interaction_features": {"enabled": False},
-                "selective_interactions": {"enabled": False},
-                "prototype_distance": {
-                    "enabled": bool(prototype_cfg.get("enabled", False)),
-                    "metric_set": list(prototype_cfg.get("metric_set", [])) if isinstance(prototype_cfg, dict) else [],
-                },
-            },
-        }
-
-    preprocess_cfg_stage2 = dict(preprocess_cfg)
-    preprocess_cfg_stage2["target_column"] = "target"
-    preprocess_cfg_stage2["id_columns"] = []
-    combined_stage2_frames: dict[str, list[pd.DataFrame]] = {"train": [], "valid": [], "test": []}
-
-    sharpening_report: dict[str, Any] = {"enabled": False}
-    if bool(feature_cfg.get("enabled", False)):
-        split_features, sharpening_report = build_stage2_feature_sharpening_split_data(
-            splits,
-            target_column="target",
-            feature_cfg=feature_cfg,
-        )
-        stage2_artifacts = run_tabular_preprocessing(split_features, preprocess_cfg_stage2)
-        for split_name, df_key in (("train", "X_train"), ("valid", "X_valid"), ("test", "X_test")):
-            combined_stage2_frames[split_name].append(getattr(stage2_artifacts, df_key).reset_index(drop=True))
-        created_groups = {
-            group: len(names)
-            for group, names in (sharpening_report.get("created_features_by_group", {}) if isinstance(sharpening_report, dict) else {}).items()
-        }
-        skipped_groups = {
-            group: len(names)
-            for group, names in (sharpening_report.get("skipped_features_by_group", {}) if isinstance(sharpening_report, dict) else {}).items()
-        }
-        print(
-            "[two_stage][stage2][feature_sharpening] "
-            f"created_feature_count={int(sharpening_report.get('created_feature_count', 0))} "
-            f"created_features={sharpening_report.get('created_features', [])}"
-        )
-        print(
-            "[two_stage][stage2][feature_sharpening] "
-            f"created_by_group={created_groups} "
-            f"skipped_by_group={skipped_groups}"
-        )
-
-    interaction_report: dict[str, Any] = {"enabled": False}
-    if bool(interaction_cfg.get("enabled", False)):
-        interaction_splits, interaction_report = build_stage2_interaction_split_data(
-            splits,
-            target_column="target",
-            feature_cfg=interaction_cfg,
-        )
-        interaction_artifacts = run_tabular_preprocessing(interaction_splits, preprocess_cfg_stage2)
-        for split_name, df_key in (("train", "X_train"), ("valid", "X_valid"), ("test", "X_test")):
-            combined_stage2_frames[split_name].append(getattr(interaction_artifacts, df_key).reset_index(drop=True))
-        created_groups = {
-            group: len(names)
-            for group, names in (interaction_report.get("created_features_by_group", {}) if isinstance(interaction_report, dict) else {}).items()
-        }
-        skipped_groups = {
-            group: len(names)
-            for group, names in (interaction_report.get("skipped_features_by_group", {}) if isinstance(interaction_report, dict) else {}).items()
-        }
-        print(
-            "[two_stage][stage2][interaction_features] "
-            f"created_feature_count={int(interaction_report.get('created_feature_count', 0))} "
-            f"created_features={interaction_report.get('created_features', [])}"
-        )
-        print(
-            "[two_stage][stage2][interaction_features] "
-            f"created_by_group={created_groups} "
-            f"skipped_by_group={skipped_groups}"
-        )
-
-    selective_report: dict[str, Any] = {"enabled": False}
-    if bool(selective_cfg.get("enabled", False)):
-        selective_splits, selective_report = build_stage2_selective_interaction_split_data(
-            splits,
-            target_column="target",
-            feature_cfg=selective_cfg,
-        )
-        selective_artifacts = run_tabular_preprocessing(selective_splits, preprocess_cfg_stage2)
-        for split_name, df_key in (("train", "X_train"), ("valid", "X_valid"), ("test", "X_test")):
-            combined_stage2_frames[split_name].append(getattr(selective_artifacts, df_key).reset_index(drop=True))
-        print(
-            "[v8] created selective interactions: "
-            f"{selective_report.get('created_features', [])}"
-        )
-        print(
-            "[v8] skipped existing interaction features: "
-            f"{selective_report.get('skipped_existing_features', [])}"
-        )
-
-    aggregated_train = pd.concat(combined_stage2_frames["train"], axis=1) if combined_stage2_frames["train"] else pd.DataFrame(index=splits["train"].index)
-    aggregated_valid = pd.concat(combined_stage2_frames["valid"], axis=1) if combined_stage2_frames["valid"] else pd.DataFrame(index=splits["valid"].index)
-    aggregated_test = pd.concat(combined_stage2_frames["test"], axis=1) if combined_stage2_frames["test"] else pd.DataFrame(index=splits["test"].index)
-    combined_created_features = (
-        list(sharpening_report.get("created_features", []))
-        + list(interaction_report.get("created_features", []))
-        + list(selective_report.get("created_features", []))
-    )
-    report = {
-        "enabled": True,
-        "requested_groups": requested_groups,
-        "interaction_requested_groups": requested_interaction_groups,
-        "selective_feature_allowlist": selective_allowlist,
-        "advanced_enrolled_separation_enabled": bool(advanced_cfg.get("enabled", False)),
-        "interaction_features_enabled": bool(interaction_cfg.get("enabled", False)),
-        "selective_interactions_enabled": bool(selective_cfg.get("enabled", False)),
-        "prototype_distance_enabled": bool(prototype_cfg.get("enabled", False)),
-        "prototype_metric_set": list(prototype_cfg.get("metric_set", [])) if isinstance(prototype_cfg, dict) else [],
-        "default_groups": list(feature_cfg.get("default_groups", [])),
-        "created_features": combined_created_features,
-        "created_feature_count": int(len(combined_created_features)),
-        "created_features_by_group": {
-            **(sharpening_report.get("created_features_by_group", {}) if isinstance(sharpening_report, dict) else {}),
-            **(interaction_report.get("created_features_by_group", {}) if isinstance(interaction_report, dict) else {}),
-            "selective_interactions": list(selective_report.get("created_features", [])),
-        },
-        "skipped_features_by_group": {
-            **(sharpening_report.get("skipped_features_by_group", {}) if isinstance(sharpening_report, dict) else {}),
-            **(interaction_report.get("skipped_features_by_group", {}) if isinstance(interaction_report, dict) else {}),
-            "selective_interactions": list(selective_report.get("skipped_features", [])),
-        },
-        "source_columns": {
-            "feature_sharpening": sharpening_report.get("source_columns", {}) if isinstance(sharpening_report, dict) else {},
-            "interaction_features": interaction_report.get("source_columns", {}) if isinstance(interaction_report, dict) else {},
-            "selective_interactions": selective_report.get("source_columns", {}) if isinstance(selective_report, dict) else {},
-        },
-        "feature_sharpening": sharpening_report,
-        "interaction_features": interaction_report,
-        "selective_interactions": selective_report,
-        "prototype_distance": {
-            "enabled": bool(prototype_cfg.get("enabled", False)),
-            "metric_set": list(prototype_cfg.get("metric_set", [])) if isinstance(prototype_cfg, dict) else [],
-        },
-    }
-    return {
-        "enabled": True,
-        "requested_groups": requested_groups,
-        "advanced_requested_groups": requested_interaction_groups,
-        "selective_feature_allowlist": selective_allowlist,
-        "report": report,
-        "X_train": aggregated_train.reset_index(drop=True),
-        "X_valid": aggregated_valid.reset_index(drop=True),
-        "X_test": aggregated_test.reset_index(drop=True),
-        "feature_names": list(aggregated_train.columns),
-    }
-
-
-def _resolve_per_model_trial_budgets(
-    tuning_cfg: dict[str, Any],
-    model_candidates: list[str],
-) -> dict[str, int]:
-    if not isinstance(tuning_cfg, dict):
-        return {}
-    raw_overrides = (
-        tuning_cfg.get("per_model_n_trials")
-        or tuning_cfg.get("per_model_optuna")
-        or tuning_cfg.get("tuning_overrides")
-        or {}
-    )
-    if not isinstance(raw_overrides, dict):
-        return {}
-
-    resolved: dict[str, int] = {}
-    candidate_set = set(model_candidates)
-    for raw_model_name, raw_value in raw_overrides.items():
-        model_name = str(raw_model_name).strip().lower()
-        if model_name not in candidate_set:
-            continue
-        try:
-            trials = int(raw_value)
-        except (TypeError, ValueError):
-            continue
-        if trials > 0:
-            resolved[model_name] = trials
-    return resolved
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 def _resolve_onehot_metadata_and_validate(
@@ -1877,21 +237,21 @@ def _resolve_onehot_metadata_and_validate(
     preprocessing_exp_cfg: dict[str, Any],
 ) -> dict[str, Any]:
     metadata = artifacts.metadata if hasattr(artifacts, "metadata") and isinstance(artifacts.metadata, dict) else {}
-    transformer = metadata.get("transformer")
     categorical_columns = metadata.get("categorical_columns", [])
+    numeric_columns = metadata.get("numeric_columns", [])
     if not isinstance(categorical_columns, list):
         categorical_columns = []
-    encoded_categorical_feature_count = 0
-
-    if bool(preprocess_cfg.get("onehot", False)) and transformer is not None:
-        try:
-            cat_pipeline = transformer.named_transformers_.get("cat")  # type: ignore[attr-defined]
-            encoder = cat_pipeline.named_steps.get("encoder") if hasattr(cat_pipeline, "named_steps") else None
-            categories = getattr(encoder, "categories_", None)
-            if categories is not None:
-                encoded_categorical_feature_count = int(sum(len(v) for v in categories))
-        except Exception:
-            encoded_categorical_feature_count = 0
+    if not isinstance(numeric_columns, list):
+        numeric_columns = []
+    encoded_categorical_feature_count = int(metadata.get("encoded_categorical_feature_count", 0) or 0)
+    per_column_counts = metadata.get("onehot_column_category_counts", {})
+    if not isinstance(per_column_counts, dict):
+        per_column_counts = {}
+    per_column_labels = metadata.get("onehot_column_category_labels", {})
+    if not isinstance(per_column_labels, dict):
+        per_column_labels = {}
+    locked_vocabulary_mode = bool(metadata.get("onehot_categories_locked", False))
+    vocabulary_source = metadata.get("onehot_categories_source")
 
     require_onehot = bool(preprocessing_exp_cfg.get("require_onehot_encoding", False))
     if require_onehot and not bool(preprocess_cfg.get("onehot", False)):
@@ -1904,233 +264,93 @@ def _resolve_onehot_metadata_and_validate(
     return {
         "onehot_enabled": bool(preprocess_cfg.get("onehot", False)),
         "require_onehot_encoding": require_onehot,
+        "input_numeric_feature_count": int(len(numeric_columns)),
         "input_categorical_feature_count": int(len(categorical_columns)),
         "encoded_categorical_feature_count": int(encoded_categorical_feature_count),
         "preprocessed_feature_count": int(artifacts.X_train.shape[1]),
+        "stable_locked_vocabulary_mode": locked_vocabulary_mode,
+        "vocabulary_source": str(vocabulary_source) if vocabulary_source else None,
+        "per_column_category_counts": {
+            str(column): int(count)
+            for column, count in per_column_counts.items()
+        },
+        "per_column_category_labels": {
+            str(column): [str(value) for value in values]
+            for column, values in per_column_labels.items()
+            if isinstance(values, list)
+        },
     }
 
 
-def _resolve_metric_column(metric_name: str, source: str) -> str:
-    token = str(metric_name).strip()
-    alias_map = {
-        "enrolled_f1": "f1_enrolled",
-        "enrolled_recall": "recall_enrolled",
-        "enrolled_precision": "precision_enrolled",
-    }
-    token = alias_map.get(token.lower(), token)
-    if token.startswith(("test_", "valid_", "cv_")):
-        return token
-    if source == "cv":
-        return f"cv_{token}_mean"
-    return f"test_{token}"
 
 
-def _sort_leaderboard_with_tiebreak(
-    leaderboard_df: pd.DataFrame,
-    selection_cfg: dict[str, Any],
-    source: str,
-) -> tuple[pd.DataFrame, str | None, list[str]]:
-    if leaderboard_df.empty:
-        return leaderboard_df, None, []
-    ranking_columns = [
-        _resolve_metric_column(metric_name, source=source)
-        for metric_name in selection_cfg.get("ranking_metrics", [])
-    ]
-    ranking_columns = [c for c in ranking_columns if c in leaderboard_df.columns]
-    if not ranking_columns:
-        return leaderboard_df, None, []
-
-    ranked = leaderboard_df.copy()
-    for col in ranking_columns:
-        ranked[col] = pd.to_numeric(ranked[col], errors="coerce")
-    ranked = ranked.sort_values(
-        by=[*ranking_columns, "model"],
-        ascending=[False] * len(ranking_columns) + [True],
-        na_position="last",
-    ).reset_index(drop=True)
-    best_model = str(ranked.iloc[0]["model"]) if not ranked.empty else None
-    return ranked, best_model, ranking_columns
 
 
-def _resolve_model_decision_rule_config(
-    exp_cfg: dict[str, Any],
-    base_decision_rule_cfg: dict[str, Any],
-    model_name: str,
-    formulation: str,
-    two_stage_enabled: bool,
-    class_metadata: dict[str, Any],
-) -> dict[str, Any]:
-    inference_cfg = exp_cfg.get("inference", {}) if isinstance(exp_cfg.get("inference", {}), dict) else {}
-    multiclass_cfg = (
-        inference_cfg.get("multiclass_decision", {})
-        if isinstance(inference_cfg.get("multiclass_decision", {}), dict)
-        else {}
-    )
-    per_model_cfg = multiclass_cfg.get("per_model", {}) if isinstance(multiclass_cfg.get("per_model", {}), dict) else {}
-    raw_override = per_model_cfg.get(model_name, {})
-    if not isinstance(raw_override, dict) or not raw_override:
-        return copy.deepcopy(base_decision_rule_cfg)
-
-    override_enabled = raw_override.get("enabled")
-    if override_enabled is False:
-        temp_cfg = copy.deepcopy(exp_cfg)
-        temp_cfg.setdefault("evaluation", {})
-        temp_cfg["evaluation"]["decision_rule"] = "argmax"
-        temp_cfg.setdefault("inference", {})
-        temp_cfg["inference"]["multiclass_decision"] = {"strategy": "argmax"}
-        return _resolve_decision_rule_config(
-            exp_cfg=temp_cfg,
-            formulation=formulation,
-            two_stage_enabled=two_stage_enabled,
-            class_metadata=class_metadata,
-        )
-
-    model_override = {k: v for k, v in raw_override.items() if k != "enabled"}
-    if not model_override:
-        return copy.deepcopy(base_decision_rule_cfg)
-
-    temp_cfg = copy.deepcopy(exp_cfg)
-    temp_cfg.setdefault("evaluation", {})
-    temp_cfg.setdefault("inference", {})
-    base_multiclass_cfg = copy.deepcopy(multiclass_cfg)
-    base_multiclass_cfg.pop("per_model", None)
-    merged_multiclass_cfg = _deep_merge_dicts(base_multiclass_cfg, model_override)
-    temp_cfg["inference"]["multiclass_decision"] = merged_multiclass_cfg
-    if "decision_rule" in model_override:
-        temp_cfg["evaluation"]["decision_rule"] = str(model_override.get("decision_rule", "argmax"))
-    elif "strategy" in merged_multiclass_cfg:
-        temp_cfg["evaluation"]["decision_rule"] = str(merged_multiclass_cfg.get("strategy", "argmax"))
-
-    return _resolve_decision_rule_config(
-        exp_cfg=temp_cfg,
-        formulation=formulation,
-        two_stage_enabled=two_stage_enabled,
-        class_metadata=class_metadata,
-    )
 
 
-def _build_prediction_export_dataframe(
-    y_true: pd.Series,
-    y_pred: Any,
-    y_proba: Any,
-    labels: list[Any] | None,
-    class_metadata: dict[str, Any] | None = None,
-    extra_columns: dict[str, Any] | pd.DataFrame | None = None,
-) -> pd.DataFrame:
-    df = pd.DataFrame({"y_true": y_true.reset_index(drop=True)})
-    if y_pred is not None:
-        df["y_pred"] = np.asarray(y_pred)
-
-    index_to_label = (
-        (class_metadata or {}).get("class_index_to_label", {})
-        if isinstance(class_metadata, dict)
-        else {}
-    )
-    if index_to_label:
-        df["true_label"] = df["y_true"].map(lambda value: index_to_label.get(str(int(value)), value))
-        if "y_pred" in df.columns:
-            df["pred_label"] = df["y_pred"].map(lambda value: index_to_label.get(str(int(value)), value))
-
-    if y_proba is None:
-        if extra_columns is not None:
-            extra_df = extra_columns if isinstance(extra_columns, pd.DataFrame) else pd.DataFrame(extra_columns)
-            _assert_same_length_arrays(
-                context="_build_prediction_export_dataframe:no_proba_extra_columns",
-                export_df=df,
-                extra_columns=extra_df,
-            )
-            df = pd.concat([df, extra_df.reset_index(drop=True)], axis=1)
-        return df
-    probs = np.asarray(y_proba, dtype=float)
-    if probs.ndim != 2:
-        return df
-
-    ordered_labels = list(labels or [])
-    if not ordered_labels:
-        ordered_labels = list(range(probs.shape[1]))
-    if probs.shape[1] != len(ordered_labels):
-        raise ValueError(
-            "Probability export failed because label/probability dimensions differ: "
-            f"n_labels={len(ordered_labels)}, proba_shape={probs.shape}."
-        )
-
-    for idx in range(probs.shape[1]):
-        class_idx = ordered_labels[idx] if idx < len(ordered_labels) else idx
-        label_name = index_to_label.get(str(class_idx), class_idx)
-        token = _metric_label_token(str(label_name))
-        df[f"proba_class_{class_idx}"] = probs[:, idx]
-        if token:
-            df[f"prob_{token}"] = probs[:, idx]
-    if extra_columns is not None:
-        extra_df = extra_columns if isinstance(extra_columns, pd.DataFrame) else pd.DataFrame(extra_columns)
-        _assert_same_length_arrays(
-            context="_build_prediction_export_dataframe:extra_columns",
-            export_df=df,
-            extra_columns=extra_df,
-        )
-        df = pd.concat([df, extra_df.reset_index(drop=True)], axis=1)
-    return df
 
 
-def _add_named_per_class_metrics(
-    metrics: dict[str, Any],
-    per_class_metrics: dict[str, dict[str, float]] | None,
-    class_index_to_label: dict[str, str],
-) -> None:
-    if not isinstance(per_class_metrics, dict):
-        return
-    for class_idx, class_metrics in per_class_metrics.items():
-        label_name = class_index_to_label.get(str(class_idx), str(class_idx))
-        label_token = _metric_label_token(label_name)
-        precision_val = float(class_metrics.get("precision", 0.0))
-        recall_val = float(class_metrics.get("recall", 0.0))
-        f1_val = float(class_metrics.get("f1", 0.0))
-        metrics[f"precision_{label_token}"] = precision_val
-        metrics[f"recall_{label_token}"] = recall_val
-        metrics[f"f1_{label_token}"] = f1_val
-        metrics[f"test_precision_{label_token}"] = precision_val
-        metrics[f"test_recall_{label_token}"] = recall_val
-        metrics[f"test_f1_{label_token}"] = f1_val
 
 
-def _add_named_per_class_metrics_with_suffix(
-    metrics: dict[str, Any],
-    per_class_metrics: dict[str, dict[str, float]] | None,
-    class_index_to_label: dict[str, str],
-    suffix: str,
-) -> None:
-    if not isinstance(per_class_metrics, dict):
-        return
-    normalized_suffix = str(suffix).strip()
-    if normalized_suffix and not normalized_suffix.startswith("_"):
-        normalized_suffix = f"_{normalized_suffix}"
-    for class_idx, class_metrics in per_class_metrics.items():
-        label_name = class_index_to_label.get(str(class_idx), str(class_idx))
-        label_token = _metric_label_token(label_name)
-        precision_val = float(class_metrics.get("precision", 0.0))
-        recall_val = float(class_metrics.get("recall", 0.0))
-        f1_val = float(class_metrics.get("f1", 0.0))
-        metrics[f"precision_{label_token}{normalized_suffix}"] = precision_val
-        metrics[f"recall_{label_token}{normalized_suffix}"] = recall_val
-        metrics[f"f1_{label_token}{normalized_suffix}"] = f1_val
-        metrics[f"test_precision_{label_token}{normalized_suffix}"] = precision_val
-        metrics[f"test_recall_{label_token}{normalized_suffix}"] = recall_val
-        metrics[f"test_f1_{label_token}{normalized_suffix}"] = f1_val
 
 
-def _add_named_validation_per_class_metrics(
-    metrics: dict[str, Any],
-    per_class_metrics: dict[str, dict[str, float]] | None,
-    class_index_to_label: dict[str, str],
-) -> None:
-    if not isinstance(per_class_metrics, dict):
-        return
-    for class_idx, class_metrics in per_class_metrics.items():
-        label_name = class_index_to_label.get(str(class_idx), str(class_idx))
-        label_token = _metric_label_token(label_name)
-        metrics[f"valid_precision_{label_token}"] = float(class_metrics.get("precision", 0.0))
-        metrics[f"valid_recall_{label_token}"] = float(class_metrics.get("recall", 0.0))
-        metrics[f"valid_f1_{label_token}"] = float(class_metrics.get("f1", 0.0))
+
+
+
+
+def _persist_paper_style_cv_artifacts(
+    *,
+    output_dir: Path,
+    model_results: dict[str, Any],
+) -> dict[str, str]:
+    runtime_dir = output_dir / "runtime_artifacts"
+    runtime_dir.mkdir(parents=True, exist_ok=True)
+
+    cv_model_rows: list[dict[str, Any]] = []
+    cv_fold_payload: dict[str, Any] = {}
+    for model_name, payload in model_results.items():
+        if not isinstance(payload, dict):
+            continue
+        metrics = payload.get("metrics", {}) if isinstance(payload.get("metrics", {}), dict) else {}
+        cv_results = payload.get("cv_results", {}) if isinstance(payload.get("cv_results", {}), dict) else {}
+        if not cv_results:
+            continue
+        row = {"model": model_name}
+        for key, value in metrics.items():
+            if str(key).startswith("cv_"):
+                row[str(key)] = value
+        cv_model_rows.append(row)
+        cv_fold_payload[model_name] = cv_results
+
+    artifact_paths: dict[str, str] = {}
+    if cv_model_rows:
+        cv_model_results_path = runtime_dir / "cv_model_results.csv"
+        pd.DataFrame(cv_model_rows).to_csv(cv_model_results_path, index=False)
+        artifact_paths["cv_model_results_csv"] = str(cv_model_results_path)
+
+        preferred_columns = [
+            "model",
+            "cv_macro_f1",
+            "cv_macro_precision",
+            "cv_macro_recall",
+            "cv_macro_f1_mean",
+            "cv_macro_precision_mean",
+            "cv_macro_recall_mean",
+        ]
+        cv_summary_df = pd.DataFrame(cv_model_rows)
+        ordered = [col for col in preferred_columns if col in cv_summary_df.columns]
+        ordered.extend([col for col in cv_summary_df.columns if col not in ordered])
+        cv_summary_df = cv_summary_df[ordered]
+        paper_style_cv_summary_path = runtime_dir / "paper_style_cv_summary.csv"
+        cv_summary_df.to_csv(paper_style_cv_summary_path, index=False)
+        artifact_paths["paper_style_cv_summary_csv"] = str(paper_style_cv_summary_path)
+
+    if cv_fold_payload:
+        cv_fold_summary_path = runtime_dir / "cv_fold_summary.json"
+        cv_fold_summary_path.write_text(json.dumps(cv_fold_payload, indent=2, default=str), encoding="utf-8")
+        artifact_paths["cv_fold_summary_json"] = str(cv_fold_summary_path)
+
+    return artifact_paths
 
 
 def _parse_threshold_grid(raw_grid: Any) -> list[float]:
@@ -2505,6 +725,23 @@ def _run_multiclass_decision_autotune(
     }
 
 
+def _build_uct_feature_table(
+    adapted: dict[str, Any] | pd.DataFrame,
+    feature_cfg: dict[str, Any],
+) -> pd.DataFrame:
+    builder_token = str(feature_cfg.get("builder", "uci_student_features")).strip().lower()
+    print(f"[features][uci] builder={builder_token}")
+    if builder_token == "uci_student_features":
+        return build_uct_student_features(adapted, feature_cfg)
+    if builder_token == "uci_student_paper_style_features":
+        return build_uci_student_paper_style_features(adapted, feature_cfg)
+    raise ValueError(
+        "Unsupported UCT/UCI feature builder "
+        f"'{builder_token}'. Supported builders: "
+        "['uci_student_features', 'uci_student_paper_style_features']."
+    )
+
+
 def _build_feature_table(dataset_cfg: dict[str, Any]) -> tuple[pd.DataFrame, str, str, str]:
     raw_dataset_name = str(dataset_cfg.get("dataset", {}).get("name", ""))
     dataset_name = _normalize_dataset_name(raw_dataset_name)
@@ -2517,7 +754,7 @@ def _build_feature_table(dataset_cfg: dict[str, Any]) -> tuple[pd.DataFrame, str
     if dataset_name == "uct_student":
         raw_df = load_uct_student_dataframe(dataset_cfg)
         adapted = adapt_uct_student_schema(raw_df, schema_cfg)
-        features = build_uct_student_features(adapted, dataset_cfg.get("features", {}))
+        features = _build_uct_feature_table(adapted, dataset_cfg.get("features", {}))
         return features, dataset_name, adapted["id_column"], adapted["target_column"]
     if dataset_name == "oulad":
         raw_tables = load_oulad_tables(dataset_cfg)
@@ -2626,13 +863,13 @@ def _build_predefined_uci_feature_splits(
             f"train={adapted_train['id_column']} test={adapted_test['id_column']}"
         )
 
-    train_features = build_uct_student_features(adapted_train, dataset_cfg.get("features", {}))
+    train_features = _build_uct_feature_table(adapted_train, dataset_cfg.get("features", {}))
     valid_features = (
-        build_uct_student_features(adapted_valid, dataset_cfg.get("features", {}))
+        _build_uct_feature_table(adapted_valid, dataset_cfg.get("features", {}))
         if adapted_valid is not None
         else None
     )
-    test_features = build_uct_student_features(adapted_test, dataset_cfg.get("features", {}))
+    test_features = _build_uct_feature_table(adapted_test, dataset_cfg.get("features", {}))
     train_prepared = _prepare_feature_df_with_target(
         train_features,
         dataset_name="uct_student",
@@ -2935,6 +1172,75 @@ def _drop_rows_with_missing_values(
     }
 
 
+def _resolve_categorical_encoding_config(preprocessing_cfg: dict[str, Any]) -> dict[str, Any]:
+    raw_cfg = preprocessing_cfg.get("categorical_encoding")
+    if isinstance(raw_cfg, dict):
+        mode = str(raw_cfg.get("mode", preprocessing_cfg.get("encoding", "onehot"))).strip().lower()
+        return {
+            "mode": mode,
+            "handle_unknown": str(raw_cfg.get("handle_unknown", "ignore")).strip().lower(),
+            "drop": raw_cfg.get("drop"),
+            "lock_category_vocabulary_from_pre_split_train": bool(
+                raw_cfg.get("lock_category_vocabulary_from_pre_split_train", False)
+            ),
+            "vocabulary_source": str(
+                raw_cfg.get("vocabulary_source", "categorical_dtype_or_full_pre_split_train")
+            ).strip(),
+        }
+    return {
+        "mode": str(raw_cfg or preprocessing_cfg.get("encoding", "onehot")).strip().lower(),
+        "handle_unknown": "ignore",
+        "drop": None,
+        "lock_category_vocabulary_from_pre_split_train": False,
+        "vocabulary_source": "subset_fit_only",
+    }
+
+
+def _build_locked_onehot_vocabulary(
+    feature_df: pd.DataFrame,
+    preprocess_cfg: dict[str, Any],
+) -> dict[str, Any]:
+    target_column = str(preprocess_cfg.get("target_column", "target"))
+    id_columns = list(preprocess_cfg.get("id_columns", []))
+    forbidden_columns = set(preprocess_cfg.get("forbidden_feature_columns", []))
+    source_features = feature_df.drop(
+        columns=[c for c in [target_column, *id_columns, *sorted(forbidden_columns)] if c in feature_df.columns]
+    ).copy()
+    source_features = source_features.where(pd.notna(source_features), np.nan)
+
+    numeric_cols, categorical_cols = detect_feature_types(source_features)
+    vocabulary: dict[str, list[Any]] = {}
+    counts: dict[str, int] = {}
+    labels: dict[str, list[str]] = {}
+    sources: dict[str, str] = {}
+
+    for column in categorical_cols:
+        series = source_features[column]
+        if isinstance(series.dtype, pd.CategoricalDtype):
+            categories = list(series.cat.categories)
+            source = "categorical_dtype"
+        else:
+            categories = pd.Index(series.dropna().astype(object).unique()).tolist()
+            source = "full_pre_split_train_unique_values"
+        vocabulary[column] = list(categories)
+        counts[column] = int(len(categories))
+        labels[column] = [str(value) for value in categories]
+        sources[column] = source
+
+    total_encoded = int(sum(counts.values()))
+    return {
+        "categories": vocabulary,
+        "source": str(preprocess_cfg.get("onehot_categories_source", "categorical_dtype_or_full_pre_split_train")),
+        "column_counts": counts,
+        "column_labels": labels,
+        "column_sources": sources,
+        "categorical_column_count": int(len(categorical_cols)),
+        "numeric_column_count": int(len(numeric_cols)),
+        "encoded_categorical_feature_count": total_encoded,
+        "preprocessed_feature_count": int(total_encoded + len(numeric_cols)),
+    }
+
+
 def _prepare_preprocessing_config(
     exp_cfg: dict[str, Any],
     dataset_cfg: dict[str, Any],
@@ -2943,9 +1249,10 @@ def _prepare_preprocessing_config(
 ) -> dict[str, Any]:
     p_cfg = exp_cfg.get("preprocessing", {})
     ds_p_cfg = dataset_cfg.get("preprocessing", {})
+    categorical_encoding_cfg = _resolve_categorical_encoding_config(p_cfg)
     imputation = str(p_cfg.get("imputation", "median_mode")).lower()
     scaling_raw = str(p_cfg.get("numeric_scaling", p_cfg.get("scaling", "standard"))).strip().lower()
-    encoding_raw = str(p_cfg.get("categorical_encoding", p_cfg.get("encoding", "onehot"))).strip().lower()
+    encoding_raw = str(categorical_encoding_cfg.get("mode", p_cfg.get("encoding", "onehot"))).strip().lower()
     forbidden_columns = {"final_result"}
     forbidden_columns.update(list(p_cfg.get("forbidden_feature_columns", []) or []))
     forbidden_columns.update(list(p_cfg.get("drop_columns", []) or []))
@@ -2960,6 +1267,12 @@ def _prepare_preprocessing_config(
         "categorical_imputation": "most_frequent",
         "scaling": scaling_raw in {"standard", "true", "1", "enabled"},
         "onehot": encoding_raw == "onehot",
+        "onehot_handle_unknown": str(categorical_encoding_cfg.get("handle_unknown", "ignore")).strip().lower(),
+        "onehot_drop": categorical_encoding_cfg.get("drop"),
+        "lock_category_vocabulary_from_pre_split_train": bool(
+            categorical_encoding_cfg.get("lock_category_vocabulary_from_pre_split_train", False)
+        ),
+        "onehot_categories_source": str(categorical_encoding_cfg.get("vocabulary_source", "subset_fit_only")).strip(),
     }
 
 
@@ -8815,7 +7128,7 @@ def _run_ablation_experiment(
         },
     }
 
-
+# Main experiment runner
 def run_experiment(experiment_config_path: Path, compact_summary: bool | None = None) -> dict[str, Any]:
     exp_cfg = _normalize_experiment_config_schema(load_yaml(experiment_config_path))
     experiment_mode = str(exp_cfg.get("experiment", {}).get("mode", "benchmark")).strip().lower()
@@ -8826,9 +7139,17 @@ def run_experiment(experiment_config_path: Path, compact_summary: bool | None = 
             compact_summary=compact_summary,
         )
     if experiment_mode == "error_audit":
-        return run_uct_3class_error_audit(exp_cfg=exp_cfg, experiment_config_path=experiment_config_path)
+        return finalize_error_audit_run(
+            result=run_error_audit_mode(exp_cfg=exp_cfg, experiment_config_path=experiment_config_path),
+            exp_cfg=exp_cfg,
+            experiment_config_path=experiment_config_path,
+        )
     if experiment_mode == "threshold_tuning":
-        return run_threshold_tuning_experiment(exp_cfg=exp_cfg, experiment_config_path=experiment_config_path)
+        return finalize_threshold_tuning_run(
+            result=run_threshold_tuning_mode(exp_cfg=exp_cfg, experiment_config_path=experiment_config_path),
+            exp_cfg=exp_cfg,
+            experiment_config_path=experiment_config_path,
+        )
 
     class_weight_cfg = exp_cfg.get("models", {}).get("class_weight", {})
     sweep_weights = _normalize_enrolled_weight_sweep(
@@ -8866,6 +7187,7 @@ def run_experiment(experiment_config_path: Path, compact_summary: bool | None = 
     print(f"[dataset] requested={requested_dataset_token}")
     print(f"[dataset] resolved={resolved_dataset_token}")
     print(f"[dataset] config_path={dataset_cfg_path}")
+    pre_split_train_feature_source_for_vocab: pd.DataFrame | None = None
     if requested_dataset_token != resolved_dataset_token:
         raise ValueError(
             "Dataset resolution mismatch. "
@@ -8898,6 +7220,7 @@ def run_experiment(experiment_config_path: Path, compact_summary: bool | None = 
             formulation=formulation,
             target_mapping=target_mapping,
         )
+        pre_split_train_feature_source_for_vocab = predefined_splits["train"].reset_index(drop=True).copy()
         train_feature_df, train_missing_meta = _drop_rows_with_missing_values(
             predefined_splits["train"],
             exp_cfg.get("preprocessing", {}),
@@ -9012,23 +7335,95 @@ def run_experiment(experiment_config_path: Path, compact_summary: bool | None = 
         id_column=id_column,
         source_target_col=source_target_col,
     )
+    if (
+        bool(preprocess_cfg.get("onehot", False))
+        and bool(preprocess_cfg.get("lock_category_vocabulary_from_pre_split_train", False))
+        and isinstance(pre_split_train_feature_source_for_vocab, pd.DataFrame)
+        and not pre_split_train_feature_source_for_vocab.empty
+    ):
+        locked_vocabulary = _build_locked_onehot_vocabulary(
+            pre_split_train_feature_source_for_vocab,
+            preprocess_cfg,
+        )
+        preprocess_cfg["onehot_categories"] = locked_vocabulary["categories"]
+        preprocess_cfg["onehot_categories_source"] = locked_vocabulary["source"]
+        print(
+            "[preprocessing][onehot] "
+            f"stable_locked_vocabulary_mode=true "
+            f"vocabulary_source={locked_vocabulary['source']} "
+            f"categorical_columns={locked_vocabulary['categorical_column_count']} "
+            f"numerical_columns={locked_vocabulary['numeric_column_count']} "
+            f"encoded_categorical_feature_count={locked_vocabulary['encoded_categorical_feature_count']} "
+            f"preprocessed_feature_count={locked_vocabulary['preprocessed_feature_count']}"
+        )
+        print(
+            "[preprocessing][onehot] "
+            f"per_column_category_counts={json.dumps(locked_vocabulary['column_counts'], sort_keys=True)}"
+        )
     artifacts = run_tabular_preprocessing(splits, preprocess_cfg)
     onehot_metadata = _resolve_onehot_metadata_and_validate(
         artifacts=artifacts,
         preprocess_cfg=preprocess_cfg,
         preprocessing_exp_cfg=(exp_cfg.get("preprocessing", {}) if isinstance(exp_cfg.get("preprocessing", {}), dict) else {}),
     )
+    if bool(onehot_metadata.get("onehot_enabled", False)):
+        artifacts.metadata["locked_category_vocabulary_summary"] = {
+            "stable_locked_vocabulary_mode": bool(onehot_metadata.get("stable_locked_vocabulary_mode", False)),
+            "vocabulary_source": onehot_metadata.get("vocabulary_source"),
+            "categorical_column_count": int(onehot_metadata.get("input_categorical_feature_count", 0)),
+            "numerical_column_count": int(onehot_metadata.get("input_numeric_feature_count", 0)),
+            "encoded_categorical_feature_count": int(onehot_metadata.get("encoded_categorical_feature_count", 0)),
+            "total_final_feature_count": int(onehot_metadata.get("preprocessed_feature_count", 0)),
+            "columns": [
+                {
+                    "column_name": str(column),
+                    "category_count": int(count),
+                    "category_labels": onehot_metadata.get("per_column_category_labels", {}).get(str(column), []),
+                }
+                for column, count in onehot_metadata.get("per_column_category_counts", {}).items()
+            ],
+        }
+        print(
+            "[preprocessing][onehot] "
+            f"stable_locked_vocabulary_mode={str(onehot_metadata.get('stable_locked_vocabulary_mode', False)).lower()} "
+            f"vocabulary_source={onehot_metadata.get('vocabulary_source')} "
+            f"categorical_column_count={onehot_metadata.get('input_categorical_feature_count', 0)} "
+            f"numerical_column_count={onehot_metadata.get('input_numeric_feature_count', 0)} "
+            f"encoded_categorical_feature_count={onehot_metadata.get('encoded_categorical_feature_count', 0)} "
+            f"preprocessed_feature_count={onehot_metadata.get('preprocessed_feature_count', 0)}"
+        )
 
     outlier_cfg = _resolve_outlier_config(exp_cfg=exp_cfg, seed=seed)
-    X_train_filtered, y_train_filtered, outlier_meta = apply_outlier_filter(
-        artifacts.X_train,
-        artifacts.y_train,
-        outlier_cfg,
+    print(
+        "[preprocessing][train_only] "
+        f"outlier_enabled={bool(outlier_cfg.get('enabled', False))} "
+        f"outlier_method={outlier_cfg.get('method', 'disabled')}"
     )
+    outlier_applied_before_preprocessing = bool(outlier_cfg.get("apply_before_preprocessing", False))
+    if outlier_applied_before_preprocessing:
+        outlier_meta = dict(artifacts.metadata.get("train_only_outlier", {}))
+        X_train_filtered = artifacts.X_train
+        y_train_filtered = artifacts.y_train
+    else:
+        X_train_filtered, y_train_filtered, outlier_meta = apply_outlier_filter(
+            artifacts.X_train,
+            artifacts.y_train,
+            outlier_cfg,
+        )
     balancing_cfg = _resolve_balancing_config(exp_cfg=exp_cfg, seed=seed)
+    print(
+        "[preprocessing][train_only] "
+        f"smote_enabled={bool(balancing_cfg.get('enabled', False))} "
+        f"smote_method={balancing_cfg.get('method', 'disabled')}"
+    )
     X_train_bal, y_train_bal, balancing_meta = apply_balancing(X_train_filtered, y_train_filtered, balancing_cfg)
+    pre_outlier_source = (
+        splits["train"]["target"]
+        if outlier_applied_before_preprocessing and "train" in splits and "target" in splits["train"].columns
+        else artifacts.y_train
+    )
     pre_outlier_class_distribution = {
-        str(k): int(v) for k, v in artifacts.y_train.value_counts(dropna=False).sort_index().to_dict().items()
+        str(k): int(v) for k, v in pre_outlier_source.value_counts(dropna=False).sort_index().to_dict().items()
     }
     post_outlier_class_distribution = {
         str(k): int(v) for k, v in y_train_filtered.value_counts(dropna=False).sort_index().to_dict().items()
@@ -9130,6 +7525,24 @@ def run_experiment(experiment_config_path: Path, compact_summary: bool | None = 
         paper_reproduction_mode=paper_reproduction_mode,
     )
     model_selection_cfg = _resolve_model_selection_config(exp_cfg=exp_cfg)
+    print(
+        "[experiment][resolved] "
+        f"dataset={resolved_dataset_token} "
+        f"dataset_config={dataset_cfg_path} "
+        f"target_formulation={formulation} "
+        f"candidate_models={model_candidates}"
+    )
+    print(
+        "[selection][resolved] "
+        f"primary_selection_metric={model_selection_cfg.get('primary_selection_metric')} "
+        f"ranking_metrics={model_selection_cfg.get('ranking_metrics', [])}"
+    )
+    print(
+        "[cv][resolved] "
+        f"enabled={bool(cv_reporting_cfg.get('enabled', False))} "
+        f"folds={int(cv_reporting_cfg.get('n_splits', 0))} "
+        f"optuna_trials_default={int((exp_cfg.get('models', {}).get('tuning', {}) if isinstance(exp_cfg.get('models', {}).get('tuning', {}), dict) else {}).get('n_trials', 0))}"
+    )
     global_balance_guard_cfg = _resolve_global_balance_guard_config(exp_cfg=exp_cfg)
     if paper_reproduction_mode:
         threshold_tuning_cfg = {
@@ -9177,461 +7590,90 @@ def run_experiment(experiment_config_path: Path, compact_summary: bool | None = 
     if two_stage_enabled:
         print(f"[two_stage][stage1][candidates] models={model_candidates}")
         print(f"[two_stage][stage2][candidates] models={model_candidates}")
-    param_overrides_cfg = exp_cfg.get("models", {}).get("param_overrides", {})
-    runtime_artifact_format = str(output_cfg.get("runtime_artifact_format", "parquet")).strip().lower()
-
-    model_results: dict[str, Any] = {}
-    leaderboard_rows: list[dict[str, Any]] = []
-    trained_models: dict[str, Any] = {}
-    optuna_artifacts: dict[str, dict[str, str]] = {}
-    model_decision_configs: dict[str, dict[str, Any]] = {}
-    runtime_artifact_overrides_by_model: dict[str, dict[str, Any]] = {}
-    stage2_feature_counts_by_model: dict[str, int] = {}
-    stage2_advanced_reports_by_model: dict[str, dict[str, Any]] = {}
-    successful_models: list[str] = []
-    failed_models: dict[str, str] = {}
-
-    for model_name in model_candidates:
-        print(
-            "[training][start] "
-            f"model={model_name} "
-            f"experiment_mode={experiment_mode} "
-            f"two_stage_enabled={two_stage_enabled} "
-            f"branch={resolved_two_stage_branch} "
-            f"stage2_tuning_enabled={bool(resolved_stage2_optuna_cfg.get('enabled', False))} "
-            f"stage2_decision_strategy={resolved_stage2_decision_cfg.get('strategy', 'argmax')}"
-        )
-        model_decision_rule_cfg = _resolve_model_decision_rule_config(
+    if two_stage_enabled:
+        mode_result = run_two_stage_mode(
+            experiment_mode=experiment_mode,
             exp_cfg=exp_cfg,
-            base_decision_rule_cfg=decision_rule_cfg,
-            model_name=model_name,
+            dataset_cfg=dataset_cfg,
+            model_candidates=model_candidates,
             formulation=formulation,
-            two_stage_enabled=two_stage_enabled,
             class_metadata=class_metadata,
+            decision_rule_cfg=decision_rule_cfg,
+            tuning_cfg=tuning_cfg,
+            tuning_backend=tuning_backend,
+            default_n_trials=default_n_trials,
+            per_model_trial_budgets=per_model_trial_budgets,
+            retrain_on_full_train_split=retrain_on_full_train_split,
+            class_weight_cfg=class_weight_cfg if isinstance(class_weight_cfg, dict) else {},
+            two_stage_decision_mode=str(two_stage_decision_mode),
+            resolved_two_stage_branch=resolved_two_stage_branch,
+            resolved_stage2_optuna_cfg=resolved_stage2_optuna_cfg,
+            resolved_stage2_decision_cfg=resolved_stage2_decision_cfg,
+            two_stage_cfg=two_stage_cfg,
+            threshold_stage1=threshold_stage1,
+            two_stage_class_thresholds=two_stage_class_thresholds,
+            two_stage_threshold_tuning_cfg=two_stage_threshold_tuning_cfg,
+            two_stage_calibration_cfg=two_stage_calibration_cfg,
+            outlier_cfg=outlier_cfg,
+            balancing_cfg=balancing_cfg,
+            stage2_feature_bundle=stage2_feature_bundle,
+            output_dir=output_dir,
+            seed=seed,
+            X_train_bal=X_train_bal,
+            y_train_bal=y_train_bal,
+            artifacts=artifacts,
+            param_overrides_cfg=param_overrides_cfg if isinstance(param_overrides_cfg, dict) else {},
+            class_weight_requested_fn=_class_weight_requested,
+            add_class_weight_metadata_metrics_fn=_add_class_weight_metadata_metrics,
+            run_two_stage_uct_model_fn=_run_two_stage_uct_model,
         )
-        model_decision_configs[model_name] = copy.deepcopy(model_decision_rule_cfg)
-        model_n_trials = int(per_model_trial_budgets.get(model_name, default_n_trials))
-        model_tuning_enabled = bool(tuning_backend == "optuna" and model_n_trials > 0)
-        model_tuning_cfg = {**tuning_cfg, "n_trials": model_n_trials}
-        params: dict[str, Any] = {}
-        model_param_overrides = {}
-        if isinstance(param_overrides_cfg, dict):
-            candidate_override = param_overrides_cfg.get(model_name, {})
-            if isinstance(candidate_override, dict):
-                model_param_overrides = candidate_override
-        tuning_score = None
-        tuning_details: dict[str, Any] = {}
-        warning_msg: str | None = None
-        if two_stage_enabled:
-            try:
-                payload, trained_model, tuning_score, tuning_details, two_stage_optuna_paths = _run_two_stage_uct_model(
-                    model_name=model_name,
-                    mode_name=experiment_mode,
-                    decision_mode=str(two_stage_decision_mode),
-                    params_overrides=model_param_overrides,
-                    seed=seed,
-                    tuning_cfg=model_tuning_cfg,
-                    tuning_enabled=model_tuning_enabled,
-                    retrain_on_full_train_split=retrain_on_full_train_split,
-                    two_stage_cfg=two_stage_cfg,
-                    class_weight_cfg=class_weight_cfg if isinstance(class_weight_cfg, dict) else {},
-                    class_metadata=class_metadata,
-                    X_train=X_train_bal,
-                    y_train=y_train_bal,
-                    X_train_stage2_base=artifacts.X_train if bool(stage2_feature_bundle.get("enabled", False)) else None,
-                    y_train_stage2_base=artifacts.y_train if bool(stage2_feature_bundle.get("enabled", False)) else None,
-                    X_valid=artifacts.X_valid,
-                    y_valid=artifacts.y_valid,
-                    X_test=artifacts.X_test,
-                    y_test=artifacts.y_test,
-                    threshold_stage1=threshold_stage1,
-                    class_thresholds=two_stage_class_thresholds,
-                    threshold_tuning_cfg=two_stage_threshold_tuning_cfg,
-                    calibration_cfg=two_stage_calibration_cfg,
-                    outlier_cfg=outlier_cfg,
-                    balancing_cfg=balancing_cfg,
-                    stage2_feature_bundle=stage2_feature_bundle,
-                    output_dir=output_dir,
-                )
-                runtime_override = payload.pop("_runtime_artifact_overrides", None)
-                if isinstance(runtime_override, dict):
-                    runtime_artifact_overrides_by_model[model_name] = runtime_override
-                stage2_feature_counts_by_model[model_name] = int(
-                    payload.get("metrics", {}).get("stage2_feature_count_seen_at_training", np.nan)
-                ) if pd.notna(payload.get("metrics", {}).get("stage2_feature_count_seen_at_training", np.nan)) else 0
-                stage2_advanced_reports_by_model[model_name] = (
-                    dict(payload.get("artifacts", {}).get("two_stage", {}).get("feature_sharpening", {}))
-                    if isinstance(payload.get("artifacts", {}).get("two_stage", {}).get("feature_sharpening", {}), dict)
-                    else {}
-                )
-                payload["class_weight"] = dict(payload.get("class_weight", {}))
-                payload["class_weight"]["class_weight_requested"] = bool(
-                    payload["class_weight"].get("class_weight_requested", False)
-                    or _class_weight_requested(class_weight_cfg)
-                    or bool(payload.get("metrics", {}).get("auto_balance_search_enabled", 0.0))
-                )
-                payload["class_weight"]["model_name"] = model_name
-                _add_class_weight_metadata_metrics(payload["metrics"], payload["class_weight"], class_metadata)
-                print(
-                    "[class_weight][model] "
-                    f"model={model_name} "
-                    f"requested={payload['class_weight'].get('class_weight_requested', False)} "
-                    f"applied={payload['class_weight'].get('class_weight_applied', False)} "
-                    f"method={payload['class_weight'].get('class_weight_application_method', 'none')} "
-                    f"mode={payload['class_weight'].get('mode', payload['class_weight'].get('strategy', 'none'))}"
-                )
-                _add_named_per_class_metrics(
-                    payload["metrics"],
-                    payload["artifacts"].get("per_class_metrics_test"),
-                    class_metadata.get("class_index_to_label", {}),
-                )
-                if tuning_details:
-                    payload["tuning"] = tuning_details
-                if two_stage_optuna_paths:
-                    optuna_artifacts[model_name] = dict(two_stage_optuna_paths)
-                    payload.setdefault("artifact_paths", {}).update(two_stage_optuna_paths)
-                model_results[model_name] = payload
-                trained_models[model_name] = trained_model
-                leaderboard_rows.append({"model": model_name, **payload["metrics"]})
-                successful_models.append(model_name)
-                print(
-                    "[training][success] "
-                    f"model={model_name} "
-                    f"test_macro_f1={float(payload['metrics'].get('test_macro_f1', np.nan)):.4f} "
-                    f"test_accuracy={float(payload['metrics'].get('test_accuracy', np.nan)):.4f} "
-                    f"test_f1_enrolled={float(payload['metrics'].get('test_f1_enrolled', np.nan)):.4f} "
-                    f"test_f1_graduate={float(payload['metrics'].get('test_f1_graduate', np.nan)):.4f} "
-                    f"test_f1_dropout={float(payload['metrics'].get('test_f1_dropout', np.nan)):.4f}"
-                )
-            except Exception as exc:
-                model_results[model_name] = {"error": f"Training/evaluation failed: {exc}"}
-                failed_models[model_name] = f"{type(exc).__name__}: {exc}"
-                print(
-                    "[training][error] "
-                    f"model={model_name} "
-                    f"experiment_mode={experiment_mode} "
-                    f"two_stage_enabled={two_stage_enabled} "
-                    f"decision_mode={two_stage_decision_mode} "
-                    f"stage2_tuning_enabled={bool(resolved_stage2_optuna_cfg.get('enabled', False))} "
-                    f"stage2_decision_strategy={resolved_stage2_decision_cfg.get('strategy', 'argmax')} "
-                    f"error={type(exc).__name__}: {exc}"
-                )
-                print(
-                    "[two_stage][stage2][error] "
-                    f"model={model_name} "
-                    f"reason={type(exc).__name__}: {exc}"
-                )
-            continue
-        if model_tuning_enabled:
-            try:
-                objective_source = str(model_tuning_cfg.get("objective_source", "cv")).strip().lower()
-                if paper_reproduction_mode:
-                    objective_source = "paper_cv"
-                params, tuning_score, tuning_details = tune_model_with_optuna(
-                    model_name=model_name,
-                    X_train=X_train_bal,
-                    y_train=y_train_bal,
-                    tuning_cfg={
-                        **model_tuning_cfg,
-                        "seed": seed,
-                        "objective_source": objective_source,
-                        "use_class_weights": _class_weight_requested(class_weight_cfg),
-                        "class_weight": {
-                            **(class_weight_cfg if isinstance(class_weight_cfg, dict) else {}),
-                            "class_label_to_index": class_metadata.get("class_label_to_index", {}),
-                        },
-                        "cv_train_df": splits.get("train", pd.DataFrame()).reset_index(drop=True),
-                        "cv_preprocess_config": preprocess_cfg,
-                        "cv_outlier_config": outlier_cfg,
-                        "cv_balancing_config": balancing_cfg,
-                        "cv_config": cv_reporting_cfg,
-                        "label_order": class_metadata.get("class_indices", []),
-                        "decision_rule": model_decision_rule_cfg.get("decision_rule", "model_predict"),
-                        "multiclass_decision": model_decision_rule_cfg.get("multiclass_decision", {}),
-                        "trial_selection": {
-                            "ranking_metrics": model_selection_cfg.get("ranking_metrics", []),
-                        },
-                    },
-                    X_valid=artifacts.X_valid,
-                    y_valid=artifacts.y_valid,
-                    fixed_params=model_param_overrides,
-                )
-                model_token = _safe_filename_token(model_name)
-                trials_path = output_dir / f"optuna_trials_{model_token}.csv"
-                best_params_path = output_dir / f"optuna_best_params_{model_token}.json"
-                trials_df = tuning_details.get("trials_dataframe")
-                if isinstance(trials_df, pd.DataFrame):
-                    trials_df.to_csv(trials_path, index=False)
-                else:
-                    pd.DataFrame(tuning_details.get("trials", [])).to_csv(trials_path, index=False)
-                best_payload = {
-                    "model": model_name,
-                    "best_params": params,
-                    "best_value": tuning_score,
-                    "objective_source": tuning_details.get("objective_source"),
-                    "best_validation_metrics": tuning_details.get("best_validation_metrics", {}),
-                    "best_cv_aggregate_metrics": tuning_details.get("best_cv_aggregate_metrics", {}),
-                    "best_per_class_metrics": tuning_details.get("best_per_class_metrics", {}),
-                    "best_per_class_f1": tuning_details.get("best_per_class_f1", {}),
-                }
-                best_params_path.write_text(json.dumps(best_payload, indent=2), encoding="utf-8")
-                optuna_artifacts[model_name] = {
-                    "trials_csv": str(trials_path),
-                    "best_params_json": str(best_params_path),
-                }
-            except Exception as exc:
-                warning_msg = f"Tuning failed; using defaults. Reason: {exc}"
-                params = dict(model_param_overrides)
-                tuning_score = None
-                tuning_details = {}
-        elif model_param_overrides:
-            params = dict(model_param_overrides)
-        try:
-            eval_cfg = {
-                "seed": seed,
-                "class_weight": {
-                    **(class_weight_cfg if isinstance(class_weight_cfg, dict) else {}),
-                    "class_label_to_index": class_metadata.get("class_label_to_index", {}),
-                },
-                "label_order": class_metadata.get("class_indices", []),
-                "decision_rule": model_decision_rule_cfg.get("decision_rule", "model_predict"),
-                "multiclass_decision": model_decision_rule_cfg.get("multiclass_decision", {}),
-            }
-            if retrain_on_full_train_split:
-                prefit_result = train_and_evaluate(
-                    model_name=model_name,
-                    params=params,
-                    X_train=X_train_bal,
-                    y_train=y_train_bal,
-                    X_valid=artifacts.X_valid,
-                    y_valid=artifacts.y_valid,
-                    X_test=artifacts.X_test,
-                    y_test=artifacts.y_test,
-                    eval_config=eval_cfg,
-                )
-                X_train_full = pd.concat([X_train_bal, artifacts.X_valid], axis=0).reset_index(drop=True)
-                y_train_full = pd.concat([y_train_bal, artifacts.y_valid], axis=0).reset_index(drop=True)
-                retrained_result = retrain_on_full_train_and_evaluate_test(
-                    model_name=model_name,
-                    params=params,
-                    X_train_full=X_train_full,
-                    y_train_full=y_train_full,
-                    X_test=artifacts.X_test,
-                    y_test=artifacts.y_test,
-                    eval_config=eval_cfg,
-                )
-                merged_metrics = dict(prefit_result.metrics)
-                merged_metrics.update(retrained_result.metrics)
-                merged_artifacts = dict(retrained_result.artifacts)
-                # Keep validation artifacts from the prefit phase for post-hoc analysis.
-                for key in ("y_true_valid", "y_pred_valid", "y_proba_valid"):
-                    if key in prefit_result.artifacts:
-                        merged_artifacts[key] = prefit_result.artifacts[key]
-                prefit_runtime_override = prefit_result.artifacts.get("runtime_artifact_override")
-                retrained_runtime_override = retrained_result.artifacts.get("runtime_artifact_override")
-                if isinstance(retrained_runtime_override, dict):
-                    merged_runtime_override = dict(retrained_runtime_override)
-                    if isinstance(prefit_runtime_override, dict) and isinstance(prefit_runtime_override.get("X_valid"), pd.DataFrame):
-                        merged_runtime_override["X_valid"] = prefit_runtime_override.get("X_valid").copy()
-                    merged_artifacts["runtime_artifact_override"] = merged_runtime_override
-                result = retrained_result
-                result = type(result)(metrics=merged_metrics, artifacts=merged_artifacts)
-            else:
-                result = train_and_evaluate(
-                    model_name=model_name,
-                    params=params,
-                    X_train=X_train_bal,
-                    y_train=y_train_bal,
-                    X_valid=artifacts.X_valid,
-                    y_valid=artifacts.y_valid,
-                    X_test=artifacts.X_test,
-                    y_test=artifacts.y_test,
-                    eval_config=eval_cfg,
-                )
-            payload = {
-                "metrics": result.metrics,
-                "artifacts": {k: v for k, v in result.artifacts.items() if k != "model"},
-                "params": result.artifacts.get("params", params),
-                "tuning_score": tuning_score,
-            }
-            runtime_override = payload["artifacts"].pop("runtime_artifact_override", None)
-            if isinstance(runtime_override, dict):
-                runtime_artifact_overrides_by_model[model_name] = runtime_override
-            payload["class_weight"] = dict(result.artifacts.get("class_weight_info", {}))
-            payload["class_weight"]["class_weight_requested"] = _class_weight_requested(class_weight_cfg)
-            payload["class_weight"]["model_name"] = model_name
-            _add_class_weight_metadata_metrics(payload["metrics"], payload["class_weight"], class_metadata)
-            print(
-                "[class_weight][model] "
-                f"model={model_name} "
-                f"requested={payload['class_weight'].get('class_weight_requested', False)} "
-                f"applied={payload['class_weight'].get('class_weight_applied', False)} "
-                f"method={payload['class_weight'].get('class_weight_application_method', 'none')} "
-                f"mode={payload['class_weight'].get('mode', payload['class_weight'].get('strategy', 'none'))}"
-            )
+    else:
+        mode_result = run_benchmark_mode(
+            experiment_mode=experiment_mode,
+            exp_cfg=exp_cfg,
+            dataset_cfg=dataset_cfg,
+            model_candidates=model_candidates,
+            resolved_two_stage_branch=resolved_two_stage_branch,
+            formulation=formulation,
+            class_metadata=class_metadata,
+            decision_rule_cfg=decision_rule_cfg,
+            tuning_cfg=tuning_cfg,
+            tuning_backend=tuning_backend,
+            default_n_trials=default_n_trials,
+            per_model_trial_budgets=per_model_trial_budgets,
+            retrain_on_full_train_split=retrain_on_full_train_split,
+            class_weight_cfg=class_weight_cfg if isinstance(class_weight_cfg, dict) else {},
+            threshold_tuning_cfg=threshold_tuning_cfg,
+            paper_reproduction_mode=paper_reproduction_mode,
+            cv_reporting_cfg=cv_reporting_cfg,
+            model_selection_cfg=model_selection_cfg,
+            param_overrides_cfg=param_overrides_cfg if isinstance(param_overrides_cfg, dict) else {},
+            seed=seed,
+            preprocess_cfg=preprocess_cfg,
+            outlier_cfg=outlier_cfg,
+            balancing_cfg=balancing_cfg,
+            splits=splits,
+            X_train_bal=X_train_bal,
+            y_train_bal=y_train_bal,
+            artifacts=artifacts,
+            output_dir=output_dir,
+            primary_metric=primary_metric,
+            class_weight_requested_fn=_class_weight_requested,
+            add_class_weight_metadata_metrics_fn=_add_class_weight_metadata_metrics,
+            run_multiclass_decision_autotune_fn=_run_multiclass_decision_autotune,
+            run_validation_threshold_tuning_fn=_run_validation_threshold_tuning,
+        )
 
-            if cv_reporting_cfg.get("enabled", False):
-                cv_eval = run_leakage_safe_stratified_cv(
-                    model_name=model_name,
-                    params=params,
-                    train_df=splits.get("train", pd.DataFrame()).reset_index(drop=True),
-                    preprocess_config=preprocess_cfg,
-                    outlier_config=outlier_cfg,
-                    balancing_config=balancing_cfg,
-                    cv_config=cv_reporting_cfg,
-                    eval_config={
-                        "seed": seed,
-                        "class_weight": {
-                            **(class_weight_cfg if isinstance(class_weight_cfg, dict) else {}),
-                            "class_label_to_index": class_metadata.get("class_label_to_index", {}),
-                        },
-                        "label_order": class_metadata.get("class_indices", []),
-                        "decision_rule": model_decision_rule_cfg.get("decision_rule", "model_predict"),
-                        "multiclass_decision": model_decision_rule_cfg.get("multiclass_decision", {}),
-                    },
-                )
-                payload["cv_results"] = cv_eval
-                aggregate_metrics = cv_eval.get("aggregate_metrics", {})
-                if isinstance(aggregate_metrics, dict):
-                    for key, value in aggregate_metrics.items():
-                        if str(key) == "cv_num_folds":
-                            payload["metrics"][str(key)] = int(value)
-                        else:
-                            payload["metrics"][str(key)] = float(value)
-                    payload["metrics"]["optuna_trials"] = float(int(model_n_trials)) if model_tuning_enabled else 0.0
-            if model_tuning_enabled:
-                payload["optuna_summary"] = {
-                    "model": model_name,
-                    "objective_source": tuning_details.get("objective_source"),
-                    "n_trials": int(model_n_trials),
-                    "best_value": tuning_score,
-                    "best_validation_metrics": tuning_details.get("best_validation_metrics", {}),
-                    "best_cv_aggregate_metrics": tuning_details.get("best_cv_aggregate_metrics", {}),
-                }
-
-            payload["metrics"]["multiclass_decision_auto_tuned"] = 0.0
-            payload["metrics"]["multiclass_decision_strategy"] = str(
-                model_decision_rule_cfg.get("decision_rule", "model_predict")
-            )
-            payload["metrics"]["tuning_objective"] = str(
-                model_decision_rule_cfg.get("multiclass_decision", {}).get("auto_tune", {}).get("objective", "macro_f1")
-            )
-            decision_auto_tune_result = _run_multiclass_decision_autotune(
-                payload=payload,
-                decision_rule_cfg=model_decision_rule_cfg,
-                class_metadata=class_metadata,
-            )
-            payload["decision_policy_tuning"] = decision_auto_tune_result
-            payload["decision_rule_config"] = copy.deepcopy(model_decision_rule_cfg)
-            payload["metrics"]["multiclass_decision_auto_tuned"] = (
-                1.0 if bool(decision_auto_tune_result.get("multiclass_decision_auto_tuned", False)) else 0.0
-            )
-            print(
-                "[decision_policy][model] "
-                f"model={model_name} "
-                f"strategy={model_decision_rule_cfg.get('decision_rule')} "
-                f"auto_tune={decision_auto_tune_result.get('multiclass_decision_auto_tuned', False)} "
-                f"grid_size={decision_auto_tune_result.get('search_grid_size', 0)} "
-                f"selected={decision_auto_tune_result.get('selected_parameters', {})} "
-                f"best_valid={decision_auto_tune_result.get('validation_objective_score_at_selected_threshold')}"
-            )
-
-            threshold_result: dict[str, Any] = {"status": "skipped", "reason": "disabled"}
-            if bool(threshold_tuning_cfg.get("enabled", False)):
-                threshold_result = _run_validation_threshold_tuning(
-                    payload=payload,
-                    class_metadata=class_metadata,
-                    threshold_cfg=threshold_tuning_cfg,
-                )
-            else:
-                threshold_result = {
-                    "status": "skipped",
-                    "reason": "disabled",
-                    "threshold_tuning_requested": False,
-                    "threshold_tuning_supported": bool(payload["artifacts"].get("y_proba_valid") is not None),
-                    "threshold_selection_split": "validation",
-                    "threshold_applied_to": "none",
-                    "default_decision_rule": "argmax",
-                }
-            payload["threshold_tuning"] = threshold_result
-
-            if threshold_result.get("status") == "applied":
-                baseline_metrics = {
-                    k: float(v)
-                    for k, v in payload["metrics"].items()
-                    if isinstance(v, (int, float)) and k.startswith("test_")
-                }
-                for key, value in baseline_metrics.items():
-                    payload["metrics"][f"{key}_default"] = float(value)
-                baseline_per_class = payload["artifacts"].get("per_class_metrics_test")
-                _add_named_per_class_metrics_with_suffix(
-                    payload["metrics"],
-                    baseline_per_class,
-                    class_metadata.get("class_index_to_label", {}),
-                    "default",
-                )
-
-                payload["artifacts"]["per_class_metrics_test_default"] = baseline_per_class
-                payload["artifacts"]["y_pred_test_default"] = payload["artifacts"].get("y_pred_test")
-                payload["artifacts"]["confusion_matrix_default"] = payload["artifacts"].get("confusion_matrix")
-
-                tuned_metrics = threshold_result.get("test_tuned_metrics", {})
-                payload["metrics"].update({f"test_{k}": float(v) for k, v in tuned_metrics.items()})
-                payload["artifacts"]["per_class_metrics_test"] = threshold_result.get("test_tuned_per_class", {})
-                if str(threshold_result.get("threshold_applied_to", "test")) == "test":
-                    payload["artifacts"]["y_pred_test"] = threshold_result.get("y_pred_test_tuned", [])
-                    payload["artifacts"]["confusion_matrix"] = threshold_result.get("confusion_matrix_tuned", [])
-                payload["threshold_tuning"]["threshold_tuning_applied"] = bool(
-                    str(payload["threshold_tuning"].get("threshold_applied_to", "none")) == "test"
-                )
-            else:
-                payload["threshold_tuning"]["threshold_tuning_applied"] = False
-
-            _add_named_per_class_metrics(
-                payload["metrics"],
-                payload["artifacts"].get("per_class_metrics_test"),
-                class_metadata.get("class_index_to_label", {}),
-            )
-            _add_named_validation_per_class_metrics(
-                payload["metrics"],
-                payload["artifacts"].get("per_class_metrics_valid"),
-                class_metadata.get("class_index_to_label", {}),
-            )
-            if tuning_details:
-                payload["tuning"] = {
-                    "scoring": str(model_tuning_cfg.get("scoring", "f1_macro")),
-                    "cv_folds": int(model_tuning_cfg.get("cv_folds", 3)),
-                    "objective_source": tuning_details.get("objective_source"),
-                    "objective_metric": primary_metric,
-                    "best_validation_metrics": tuning_details.get("best_validation_metrics", {}),
-                    "best_per_class_metrics": tuning_details.get("best_per_class_metrics", {}),
-                    "best_per_class_f1": tuning_details.get("best_per_class_f1", {}),
-                    "n_trials": int(model_n_trials),
-                }
-            if model_name in optuna_artifacts:
-                payload.setdefault("artifact_paths", {}).update(optuna_artifacts[model_name])
-            if warning_msg:
-                payload["warning"] = warning_msg
-            model_results[model_name] = payload
-            trained_models[model_name] = result.artifacts.get("model")
-            leaderboard_rows.append({"model": model_name, **payload["metrics"]})
-            successful_models.append(model_name)
-            print(
-                "[training][success] "
-                f"model={model_name} "
-                f"test_macro_f1={float(payload['metrics'].get('test_macro_f1', np.nan)):.4f} "
-                f"test_accuracy={float(payload['metrics'].get('test_accuracy', np.nan)):.4f}"
-            )
-        except Exception as exc:
-            model_results[model_name] = {"error": f"Training/evaluation failed: {exc}"}
-            failed_models[model_name] = f"{type(exc).__name__}: {exc}"
-            print(
-                "[training][error] "
-                f"model={model_name} "
-                f"experiment_mode={experiment_mode} "
-                f"two_stage_enabled={two_stage_enabled} "
-                f"error={type(exc).__name__}: {exc}"
-            )
+    model_results = mode_result["model_results"]
+    leaderboard_rows = mode_result["leaderboard_rows"]
+    trained_models = mode_result["trained_models"]
+    optuna_artifacts = mode_result["optuna_artifacts"]
+    model_decision_configs = mode_result["model_decision_configs"]
+    runtime_artifact_overrides_by_model = mode_result["runtime_artifact_overrides_by_model"]
+    stage2_feature_counts_by_model = mode_result["stage2_feature_counts_by_model"]
+    stage2_advanced_reports_by_model = mode_result["stage2_advanced_reports_by_model"]
+    successful_models = mode_result["successful_models"]
+    failed_models = mode_result["failed_models"]
 
     leaderboard_df = pd.DataFrame(leaderboard_rows)
     print(
@@ -9748,525 +7790,74 @@ def run_experiment(experiment_config_path: Path, compact_summary: bool | None = 
                 f"successful_models={successful_models}, metric_key={metric_key}, "
                 f"leaderboard_columns={leaderboard_df.columns.tolist()}."
             )
-
-    stage2_feature_sharpening_report_path: Path | None = None
-    stage2_advanced_feature_report_path: Path | None = None
-    if two_stage_enabled:
-        stage2_feature_report_payload = (
-            dict(stage2_feature_bundle.get("report", {}))
-            if isinstance(stage2_feature_bundle.get("report", {}), dict)
-            else {"enabled": False}
-        )
-        stage2_feature_report_payload["enabled"] = bool(stage2_feature_bundle.get("enabled", False))
-        stage2_feature_report_payload["requested_groups"] = list(stage2_feature_bundle.get("requested_groups", []))
-        stage2_feature_report_payload["interaction_requested_groups"] = list(stage2_feature_bundle.get("advanced_requested_groups", []))
-        stage2_feature_report_payload["stage1_candidate_models"] = list(model_candidates)
-        stage2_feature_report_payload["stage2_candidate_models"] = list(model_candidates)
-        stage2_feature_report_payload["per_model_stage2_feature_count"] = stage2_feature_counts_by_model
-        stage2_feature_sharpening_report_path = output_dir / "stage2_feature_sharpening_report.json"
-        stage2_feature_sharpening_report_path.write_text(
-            json.dumps(stage2_feature_report_payload, indent=2),
-            encoding="utf-8",
-        )
-        prototype_source_columns: list[str] = []
-        prototype_feature_columns: list[str] = []
-        for model_name in model_candidates:
-            model_report = stage2_advanced_reports_by_model.get(model_name, {})
-            prototype_report = (
-                model_report.get("prototype_distance", {})
-                if isinstance(model_report.get("prototype_distance", {}), dict)
-                else {}
-            )
-            for col in prototype_report.get("prototype_source_columns", []):
-                if col not in prototype_source_columns:
-                    prototype_source_columns.append(col)
-            for col in prototype_report.get("prototype_feature_columns", []):
-                if col not in prototype_feature_columns:
-                    prototype_feature_columns.append(col)
-        stage2_advanced_feature_report_payload = {
-            "feature_sharpening_enabled": bool(stage2_feature_report_payload.get("feature_sharpening", {}).get("enabled", False)),
-            "interaction_features_enabled": bool(stage2_feature_report_payload.get("interaction_features_enabled", False)),
-            "prototype_distance_enabled": bool(stage2_feature_report_payload.get("prototype_distance_enabled", False)),
-            "requested_groups": list(stage2_feature_report_payload.get("requested_groups", [])),
-            "interaction_requested_groups": list(stage2_feature_report_payload.get("interaction_requested_groups", [])),
-            "created_feature_names": list(stage2_feature_report_payload.get("created_features", [])),
-            "skipped_feature_reasons": stage2_feature_report_payload.get("skipped_features_by_group", {}),
-            "prototype_source_columns": prototype_source_columns,
-            "prototype_feature_columns": prototype_feature_columns,
-            "per_model_stage2_feature_count": stage2_feature_counts_by_model,
-        }
-        stage2_advanced_feature_report_path = output_dir / "stage2_advanced_feature_report.json"
-        stage2_advanced_feature_report_path.write_text(
-            json.dumps(stage2_advanced_feature_report_payload, indent=2),
-            encoding="utf-8",
-        )
-
-    compact_mode = bool(output_cfg.get("compact_summary", False)) if compact_summary is None else bool(compact_summary)
-    summary = {
-        "experiment_id": experiment_id,
-        "benchmark_summary_version": BENCHMARK_SUMMARY_VERSION,
-        "schema_version": BENCHMARK_SUMMARY_VERSION,
-        "dataset_name": dataset_name,
-        "dataset_config": {
-            "requested": requested_dataset_token,
-            "resolved": resolved_dataset_token,
-            "path": str(dataset_cfg_path),
-            "source_format": dataset_source_cfg.get("format"),
-            "split_mode": dataset_source_cfg.get("split_mode"),
-            "effective_split_mode": missing_value_meta.get("effective_split_mode"),
-            "internal_valid_source": missing_value_meta.get("internal_valid_source"),
-            "train_path": dataset_source_cfg.get("train_path"),
-            "valid_path": dataset_source_cfg.get("valid_path"),
-            "test_path": dataset_source_cfg.get("test_path"),
-        },
-        "target_formulation": formulation,
-        "class_metadata": class_metadata,
-        "primary_metric": metric_key,
-        "best_model": best_model,
-        "output_dir": str(output_dir),
-        "seed": seed,
-        "split_config": {
-            "test_size": float(exp_cfg["splits"]["test_size"]),
-            "validation_size": float(exp_cfg["splits"].get("validation_size", 0.2)),
-            "stratify_column": str(exp_cfg["splits"].get("stratify_column", "target")),
-        },
-        "split_sizes": {
-            "train_raw": int(len(splits.get("train", pd.DataFrame()))),
-            "valid_raw": int(len(splits.get("valid", pd.DataFrame()))),
-            "test_raw": int(len(splits.get("test", pd.DataFrame()))),
-            "train_after_preprocessing": int(len(artifacts.X_train)),
-            "valid_after_preprocessing": int(len(artifacts.X_valid)),
-            "test_after_preprocessing": int(len(artifacts.X_test)),
-            "train_after_outlier": int(len(X_train_filtered)),
-            "train_after_balancing": int(len(X_train_bal)),
-        },
-        "model_results": model_results,
-        "leaderboard": leaderboard_df.to_dict(orient="records"),
-        "preprocessing": {
-            "missing_values": missing_value_meta,
-            "outlier": outlier_meta,
-            "balancing": balancing_meta,
-            "class_distribution_train_before_outlier": pre_outlier_class_distribution,
-            "class_distribution_train_after_outlier": post_outlier_class_distribution,
-            "feature_count_after_preprocessing": int(artifacts.X_train.shape[1]),
-            "preprocessed_feature_count": int(onehot_metadata.get("preprocessed_feature_count", int(artifacts.X_train.shape[1]))),
-            "onehot_enabled": bool(onehot_metadata.get("onehot_enabled", False)),
-            "require_onehot_encoding": bool(onehot_metadata.get("require_onehot_encoding", False)),
-            "input_categorical_feature_count": int(onehot_metadata.get("input_categorical_feature_count", 0)),
-            "encoded_categorical_feature_count": int(onehot_metadata.get("encoded_categorical_feature_count", 0)),
-        },
-        "class_weight": class_weight_cfg if isinstance(class_weight_cfg, dict) else {},
-        "threshold_tuning": threshold_tuning_cfg,
-        "cross_validation": cv_reporting_cfg,
-        "decision_policy": decision_rule_cfg,
-        "summary_mode": "compact" if compact_mode else "full",
-        "successful_models": list(successful_models),
-        "failed_models": dict(failed_models),
-        "successful_candidate_count": int(len(successful_models)),
-        "failed_candidate_count": int(len(failed_models)),
-    }
-    if two_stage_enabled:
-        summary["two_stage_feature_sharpening"] = (
-            dict(stage2_feature_bundle.get("report", {}))
-            if isinstance(stage2_feature_bundle.get("report", {}), dict)
-            else {"enabled": False}
-        )
     if best_by_cv.get("model") is not None:
-        summary["best_by_cv"] = best_by_cv
-    if best_by_test.get("model") is not None:
-        summary["best_by_test"] = best_by_test
-    if model_selection_cfg.get("enabled", False):
-        summary["selection"] = model_selection_cfg
-    if bool(global_balance_guard_cfg.get("enabled", False)):
-        summary["global_balance_guard"] = {
-            **global_balance_guard_cfg,
-            **global_balance_guard_report,
-        }
-    model_mechanism_audit: dict[str, Any] = {}
-    for model_name, payload in model_results.items():
-        if not isinstance(payload, dict) or "metrics" not in payload:
-            continue
-        class_weight_meta = payload.get("class_weight", {}) if isinstance(payload.get("class_weight", {}), dict) else {}
-        threshold_meta = payload.get("threshold_tuning", {}) if isinstance(payload.get("threshold_tuning", {}), dict) else {}
-        decision_meta = payload.get("decision_policy_tuning", {}) if isinstance(payload.get("decision_policy_tuning", {}), dict) else {}
-        model_decision_cfg = (
-            payload.get("decision_rule_config", {})
-            if isinstance(payload.get("decision_rule_config", {}), dict)
-            else model_decision_configs.get(model_name, {})
+        print(
+            "[selection][best_by_cv] "
+            f"selected={best_by_cv.get('model')} "
+            f"ranking_columns={best_by_cv.get('ranking_columns', [])}"
         )
-        model_mechanism_audit[model_name] = {
-            "decision_rule": str(model_decision_cfg.get("decision_rule", "model_predict")),
-            "decision_strategy": str(
-                model_decision_cfg.get("multiclass_decision", {}).get(
-                    "strategy",
-                    model_decision_cfg.get("decision_rule", "model_predict"),
-                )
-            ),
-            "multiclass_decision_auto_tuned": bool(decision_meta.get("multiclass_decision_auto_tuned", False)),
-            "multiclass_decision_tuning_objective": decision_meta.get("tuning_objective"),
-            "multiclass_decision_selected_parameters": decision_meta.get("selected_parameters", {}),
-            "validation_objective_score_at_selected_threshold": decision_meta.get(
-                "validation_objective_score_at_selected_threshold"
-            ),
-            "class_weight_requested": bool(class_weight_meta.get("class_weight_requested", False)),
-            "class_weight_supported": bool(class_weight_meta.get("class_weight_supported", False)),
-            "class_weight_applied": bool(class_weight_meta.get("class_weight_applied", False)),
-            "class_weight_effective": str(class_weight_meta.get("effective_mechanism", "none")),
-            "class_weight_values": class_weight_meta.get("weight_map", {}),
-            "class_weight_backend_note": class_weight_meta.get("class_weight_backend_note"),
-            "threshold_tuning_requested": bool(threshold_meta.get("threshold_tuning_requested", False)),
-            "threshold_tuning_supported": bool(threshold_meta.get("threshold_tuning_supported", False)),
-            "threshold_tuning_applied": bool(threshold_meta.get("threshold_tuning_applied", False)),
-            "threshold_selection_split": str(threshold_meta.get("threshold_selection_split", "validation")),
-            "threshold_applied_to": str(threshold_meta.get("threshold_applied_to", "none")),
-            "selected_thresholds": threshold_meta.get("selected_thresholds", {}),
-            "stage2_decision_objective_mode": payload.get("metrics", {}).get("stage2_decision_objective_mode"),
-            "stage2_decision_requested": payload.get("metrics", {}).get("stage2_decision_requested"),
-            "stage2_decision_executed": payload.get("metrics", {}).get("stage2_decision_executed"),
-            "stage2_decision_accepted": payload.get("metrics", {}).get("stage2_decision_accepted"),
-            "stage2_decision_reject_reason": payload.get("metrics", {}).get("stage2_decision_reject_reason"),
-        }
-    summary["model_mechanism_audit"] = model_mechanism_audit
-    summary["artifact_paths"] = _persist_runtime_artifacts(
-        output_dir=output_dir,
-        best_model_name=best_model,
+
+    execution = BenchmarkExecutionResult(
+        model_results=model_results,
+        leaderboard_df=leaderboard_df,
         trained_models=trained_models,
-        preprocessing_artifacts=artifacts,
-        summary=summary,
+        optuna_artifacts=optuna_artifacts,
+        model_decision_configs=model_decision_configs,
         runtime_artifact_overrides_by_model=runtime_artifact_overrides_by_model,
-        file_format=runtime_artifact_format,
+        stage2_feature_counts_by_model=stage2_feature_counts_by_model,
+        stage2_advanced_reports_by_model=stage2_advanced_reports_by_model,
+        successful_models=successful_models,
+        failed_models=failed_models,
+        best_model=best_model,
+        best_by_cv=best_by_cv,
+        best_by_test=best_by_test,
+        global_balance_guard_report=global_balance_guard_report,
     )
-
-    contract_paths = _persist_required_contract_outputs(
+    finalization_context = BenchmarkFinalizationContext(
+        compact_summary=compact_summary,
+        output_cfg=output_cfg,
         output_dir=output_dir,
-        summary=summary,
-        best_model_name=best_model,
-        trained_models=trained_models,
-        y_test=artifacts.y_test,
+        experiment_id=experiment_id,
+        dataset_name=dataset_name,
+        dataset_cfg_path=dataset_cfg_path,
+        requested_dataset_token=requested_dataset_token,
+        resolved_dataset_token=resolved_dataset_token,
+        dataset_source_cfg=dataset_source_cfg,
+        formulation=formulation,
         class_metadata=class_metadata,
+        metric_key=metric_key,
+        seed=seed,
+        exp_cfg=exp_cfg,
+        splits=splits,
+        artifacts=artifacts,
+        X_train_filtered=X_train_filtered,
+        X_train_bal=X_train_bal,
+        y_train_bal=y_train_bal,
+        missing_value_meta=missing_value_meta,
+        outlier_meta=outlier_meta,
+        balancing_meta=balancing_meta,
+        pre_outlier_class_distribution=pre_outlier_class_distribution,
+        post_outlier_class_distribution=post_outlier_class_distribution,
+        onehot_metadata=onehot_metadata,
+        class_weight_cfg=class_weight_cfg if isinstance(class_weight_cfg, dict) else {},
+        threshold_tuning_cfg=threshold_tuning_cfg,
+        cv_reporting_cfg=cv_reporting_cfg,
+        decision_rule_cfg=decision_rule_cfg,
+        two_stage_enabled=two_stage_enabled,
+        two_stage_feature_bundle=stage2_feature_bundle,
+        model_candidates=model_candidates,
+        model_selection_cfg=model_selection_cfg,
+        global_balance_guard_cfg=global_balance_guard_cfg,
+        runtime_artifact_format=runtime_artifact_format,
+        tuning_enabled=tuning_enabled,
+        primary_metric=primary_metric,
+        benchmark_summary_version=BENCHMARK_SUMMARY_VERSION,
+        persist_paper_style_cv_artifacts_fn=_persist_paper_style_cv_artifacts,
+        safe_filename_token_fn=_safe_filename_token,
     )
-    summary["artifact_paths"].update(contract_paths)
-    run_stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-    summary["artifact_paths"].update(
-        _persist_per_model_run_outputs(
-            output_dir=output_dir,
-            run_stamp=run_stamp,
-            model_results=model_results,
-            trained_models=trained_models,
-            class_metadata=class_metadata,
-        )
-    )
+    return finalize_benchmark_run(context=finalization_context, execution=execution)
 
-    figure_status: dict[str, dict[str, Any]] = {}
-    summary["artifact_status"] = (
-        dict(summary.get("artifact_status", {}))
-        if isinstance(summary.get("artifact_status", {}), dict)
-        else {}
-    )
-    print(
-        "[finalization][start] "
-        f"successful_candidates={len(successful_models)} "
-        f"failed_candidates={len(failed_models)} "
-        f"best_model={best_model}"
-    )
-    summary["artifact_paths"]["benchmark_summary"] = str(output_dir / "benchmark_summary.json")
-    summary["artifact_paths"]["leaderboard"] = str(output_dir / "leaderboard.csv")
-    summary["artifact_paths"]["summary_csv"] = str(output_dir / "summary.csv")
-    summary["artifact_paths"]["benchmark_markdown"] = str(output_dir / "benchmark_summary.md")
-    summary["artifact_paths"]["artifact_manifest"] = str(output_dir / "artifact_manifest.json")
-    if stage2_feature_sharpening_report_path is not None:
-        summary["artifact_paths"]["stage2_feature_sharpening_report"] = str(stage2_feature_sharpening_report_path)
-    if stage2_advanced_feature_report_path is not None:
-        summary["artifact_paths"]["stage2_advanced_feature_report"] = str(stage2_advanced_feature_report_path)
-    for model_name, paths in optuna_artifacts.items():
-        model_token = _safe_filename_token(model_name)
-        summary["artifact_paths"][f"optuna_trials_{model_token}"] = paths["trials_csv"]
-        summary["artifact_paths"][f"optuna_best_params_{model_token}"] = paths["best_params_json"]
-    failure_artifacts: dict[str, str] = {}
-    if failed_models:
-        failure_artifacts = _write_benchmark_failure_summary(
-            output_dir=output_dir,
-            experiment_id=experiment_id,
-            requested_models=model_candidates,
-            model_results=model_results,
-            failed_models=failed_models,
-            successful_models=successful_models,
-            reason="partial_candidate_failures",
-        )
-        summary["artifact_paths"].update(failure_artifacts)
-    print("[finalization][summary_write_begin]")
-    try:
-        save_benchmark_summary(summary, output_dir, compact=compact_mode)
-        summary["artifact_paths"]["benchmark_summary"] = str(output_dir / "benchmark_summary.json")
-        summary["artifact_status"]["benchmark_summary"] = _status_from_path(output_dir / "benchmark_summary.json")
-        summary["artifact_status"]["leaderboard"] = _status_from_path(output_dir / "leaderboard.csv")
-        summary["artifact_status"]["summary_csv"] = _status_from_path(output_dir / "summary.csv")
-        print("[finalization][summary_written]")
-    except Exception as exc:
-        if failed_models:
-            _write_benchmark_failure_summary(
-                output_dir=output_dir,
-                experiment_id=experiment_id,
-                requested_models=model_candidates,
-                model_results=model_results,
-                failed_models=failed_models,
-                successful_models=successful_models,
-                reason=f"finalization_summary_write_failed:{type(exc).__name__}",
-            )
-        raise
-
-    mirror_enabled = bool(output_cfg.get("mirror_benchmark_outputs_to_runtime", False))
-    if mirror_enabled:
-        try:
-            mirrored = _mirror_root_artifacts_to_runtime(
-                output_dir=output_dir,
-                runtime_dir=output_dir / "runtime_artifacts",
-                model_candidates=model_candidates,
-            )
-            for name, path in mirrored.items():
-                summary["artifact_paths"][f"runtime_{name}"] = path
-        except Exception as exc:
-            print(f"[finalization][warning] runtime mirroring failed: {type(exc).__name__}: {exc}")
-            summary.setdefault("finalization_warnings", []).append(
-                f"runtime_mirroring_failed:{type(exc).__name__}: {exc}"
-            )
-
-    if best_model and best_model in trained_models and trained_models[best_model] is not None:
-        best_payload = model_results.get(best_model, {})
-        print("[finalization][figures_begin]")
-        try:
-            figure_result = generate_all_figures(
-                model=trained_models[best_model],
-                X_train=X_train_bal,
-                y_train=y_train_bal,
-                X_test=artifacts.X_test,
-                y_test=artifacts.y_test,
-                y_pred_proba=best_payload.get("artifacts", {}).get("y_proba_test"),
-                output_dir=output_dir,
-                experiment_name=experiment_id,
-                primary_metric=primary_metric,
-                random_state=seed,
-                include_status=True,
-            )
-            figure_paths = figure_result.get("artifact_paths", {})
-            figure_status = figure_result.get("artifact_status", {})
-            summary["artifact_paths"].update(figure_paths)
-            summary["artifact_status"].update(figure_status)
-            print("[finalization][figures_done]")
-        except Exception as exc:
-            print(f"[finalization][figures_failed] {type(exc).__name__}: {exc}")
-            figure_status = {
-                "learning_curve": {"status": "failed", "reason": f"figure_generation_failed:{type(exc).__name__}: {exc}"},
-                "pr_curve": {"status": "failed", "reason": f"figure_generation_failed:{type(exc).__name__}: {exc}"},
-                "shap_beeswarm": {"status": "failed", "reason": f"figure_generation_failed:{type(exc).__name__}: {exc}"},
-                "shap_waterfall": {"status": "failed", "reason": f"figure_generation_failed:{type(exc).__name__}: {exc}"},
-            }
-            summary["artifact_status"].update(figure_status)
-    else:
-        figure_status["learning_curve"] = {
-            "status": "skipped",
-            "reason": "best_model_missing_or_unavailable",
-        }
-        figure_status["pr_curve"] = {
-            "status": "skipped",
-            "reason": "best_model_missing_or_unavailable",
-        }
-        figure_status["shap_beeswarm"] = {
-            "status": "skipped",
-            "reason": "best_model_missing_or_unavailable",
-        }
-        figure_status["shap_waterfall"] = {
-            "status": "skipped",
-            "reason": "best_model_missing_or_unavailable",
-        }
-        summary["artifact_status"].update(figure_status)
-
-    try:
-        _ensure_explainability_compatible_artifact_paths(summary)
-    except Exception as exc:
-        print(f"[finalization][warning] explainability contract compatibility check failed: {type(exc).__name__}: {exc}")
-        summary.setdefault("finalization_warnings", []).append(
-            f"explainability_contract_check_failed:{type(exc).__name__}: {exc}"
-        )
-
-    try:
-        explain_json, explain_md = write_skipped_explainability_report(
-            output_dir=output_dir,
-            reason="explainability_not_run_yet",
-        )
-    except Exception as exc:
-        print(f"[finalization][warning] skipped explainability report failed: {type(exc).__name__}: {exc}")
-        explain_json = output_dir / "explainability" / "explainability_status.json"
-        explain_md = output_dir / "explainability" / "README.md"
-        summary.setdefault("finalization_warnings", []).append(
-            f"skipped_explainability_report_failed:{type(exc).__name__}: {exc}"
-        )
-
-    print("[finalization][summary_refresh_begin]")
-    try:
-        save_benchmark_summary(summary, output_dir, compact=compact_mode)
-        summary["artifact_paths"]["benchmark_summary"] = str(output_dir / "benchmark_summary.json")
-        summary["artifact_status"]["benchmark_summary"] = _status_from_path(output_dir / "benchmark_summary.json")
-        summary["artifact_status"]["leaderboard"] = _status_from_path(output_dir / "leaderboard.csv")
-        summary["artifact_status"]["summary_csv"] = _status_from_path(output_dir / "summary.csv")
-        print("[finalization][summary_refresh_done]")
-    except Exception as exc:
-        print(f"[finalization][warning] summary refresh failed: {type(exc).__name__}: {exc}")
-        summary.setdefault("finalization_warnings", []).append(
-            f"summary_refresh_failed:{type(exc).__name__}: {exc}"
-        )
-
-    confusion_matrix_paths = sorted(output_dir.glob("confusion_matrix_*.png"))
-    normalized_confusion_matrix_paths = sorted(output_dir.glob("confusion_matrix_*_normalized.png"))
-    classification_report_paths = sorted(output_dir.glob("classification_report_*.json"))
-
-    mandatory_updates: dict[str, dict[str, Any]] = {
-        "benchmark_summary_json": _status_from_path(summary["artifact_paths"]["benchmark_summary"]),
-        "benchmark_summary_md": _status_from_path(summary["artifact_paths"]["benchmark_markdown"]),
-        "metrics_json": _status_from_path(summary["artifact_paths"]["metrics"]),
-        "predictions_csv": _status_from_path(summary["artifact_paths"]["predictions"]),
-        "leaderboard_csv": _status_from_path(summary["artifact_paths"]["leaderboard"]),
-        "summary_csv": _status_from_path(summary["artifact_paths"]["summary_csv"]),
-        "runtime_artifacts_dir": _status_from_path(output_dir / "runtime_artifacts"),
-        "model_dir": _status_from_path(output_dir / "model"),
-        "learning_curve_png": figure_status.get(
-            "learning_curve",
-            {"status": "failed", "reason": "figure_generation_error"},
-        ),
-        "pr_curve_png": figure_status.get(
-            "pr_curve",
-            {"status": "failed", "reason": "figure_generation_error"},
-        ),
-    }
-
-    if confusion_matrix_paths:
-        mandatory_updates["confusion_matrix_artifacts"] = {
-            "status": "generated",
-            "paths": [str(p) for p in confusion_matrix_paths],
-        }
-    else:
-        mandatory_updates["confusion_matrix_artifacts"] = {
-            "status": "skipped",
-            "reason": "not_generated_by_reporting",
-        }
-    if normalized_confusion_matrix_paths:
-        mandatory_updates["normalized_confusion_matrix_artifacts"] = {
-            "status": "generated",
-            "paths": [str(p) for p in normalized_confusion_matrix_paths],
-        }
-    else:
-        mandatory_updates["normalized_confusion_matrix_artifacts"] = {
-            "status": "skipped",
-            "reason": "not_generated_by_reporting",
-        }
-    if classification_report_paths:
-        mandatory_updates["classification_report_artifacts"] = {
-            "status": "generated",
-            "paths": [str(p) for p in classification_report_paths],
-        }
-    else:
-        mandatory_updates["classification_report_artifacts"] = {
-            "status": "skipped",
-            "reason": "not_generated_by_reporting",
-        }
-    if optuna_artifacts:
-        mandatory_updates["optuna_artifacts"] = {
-            "status": "generated",
-            "details": optuna_artifacts,
-        }
-    elif tuning_enabled:
-        mandatory_updates["optuna_artifacts"] = {
-            "status": "failed",
-            "reason": "tuning_enabled_but_no_optuna_artifacts_saved",
-        }
-
-    optional_updates: dict[str, dict[str, Any]] = {
-        "shap_beeswarm_png": figure_status.get(
-            "shap_beeswarm",
-            {"status": "skipped", "reason": "not_applicable_for_model_type"},
-        ),
-        "shap_waterfall_pngs": figure_status.get(
-            "shap_waterfall",
-            {"status": "skipped", "reason": "not_applicable_for_model_type"},
-        ),
-        "explainability_dir": {
-            "status": "created",
-            "path": str(output_dir / "explainability"),
-        },
-        "explainability_report_json": {
-            "status": "created",
-            "path": str(explain_json),
-            "reason": "explainability_not_run_yet",
-        },
-        "explainability_report_md": {
-            "status": "created",
-            "path": str(explain_md),
-            "reason": "explainability_not_run_yet",
-        },
-        "lime_outputs": {
-            "status": "skipped",
-            "reason": "explainability_not_run_yet",
-        },
-        "aime_outputs": {
-            "status": "skipped",
-            "reason": "explainability_not_run_yet",
-        },
-        "shap_outputs": {
-            "status": "skipped",
-            "reason": "explainability_not_run_yet",
-        },
-        "threshold_tuning_inline": {
-            "status": "enabled" if bool(threshold_tuning_cfg.get("enabled", False)) else "disabled",
-            "objective": str(threshold_tuning_cfg.get("objective", "macro_f1")),
-            "focus_class": str(threshold_tuning_cfg.get("focus_class", "Enrolled")),
-        },
-    }
-    if stage2_feature_sharpening_report_path is not None:
-        optional_updates["stage2_feature_sharpening_report"] = _status_from_path(stage2_feature_sharpening_report_path)
-    if stage2_advanced_feature_report_path is not None:
-        optional_updates["stage2_advanced_feature_report"] = _status_from_path(stage2_advanced_feature_report_path)
-
-    print("[finalization][manifest_begin]")
-    try:
-        update_artifact_manifest(
-            output_dir=output_dir,
-            mandatory_updates=mandatory_updates,
-            optional_updates=optional_updates,
-            metadata_updates={
-                "experiment_id": experiment_id,
-                "dataset_name": dataset_name,
-                "target_formulation": formulation,
-                "best_model": best_model,
-                "manifest_scope": "benchmark",
-            },
-        )
-        print("[finalization][manifest_done]")
-    except Exception as exc:
-        print(f"[finalization][manifest_failed] {type(exc).__name__}: {exc}")
-        summary.setdefault("finalization_warnings", []).append(
-            f"artifact_manifest_update_failed:{type(exc).__name__}: {exc}"
-        )
-    if mirror_enabled:
-        try:
-            _mirror_root_artifacts_to_runtime(
-                output_dir=output_dir,
-                runtime_dir=output_dir / "runtime_artifacts",
-                model_candidates=model_candidates,
-            )
-        except Exception as exc:
-            print(f"[finalization][warning] post-manifest runtime mirroring failed: {type(exc).__name__}: {exc}")
-            summary.setdefault("finalization_warnings", []).append(
-                f"post_manifest_runtime_mirroring_failed:{type(exc).__name__}: {exc}"
-            )
-    if summary.get("finalization_warnings"):
-        try:
-            save_benchmark_summary(summary, output_dir, compact=compact_mode)
-        except Exception:
-            pass
-    print("[finalization][complete]")
-    return summary
-
-
+# CLI main
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--experiment-config", type=Path, required=True)

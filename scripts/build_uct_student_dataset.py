@@ -13,6 +13,9 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from src.data.adapters.uct_student_adapter import adapt_uct_student_schema
+from src.data.feature_builders.uci_student_paper_style_features import (
+    build_uci_student_paper_style_features,
+)
 from src.data.feature_builders.uct_student_features import build_uct_student_features
 from src.data.loaders.uct_student_loader import load_uct_student_dataframe
 
@@ -54,6 +57,19 @@ def _derive_new_columns(before_columns: Iterable[str], after_columns: Iterable[s
     return sorted([col for col in after_columns if col not in before_set])
 
 
+def _build_uct_feature_table(adapted: dict[str, Any], feature_cfg: dict[str, Any]) -> Any:
+    builder_token = str(feature_cfg.get("builder", "uci_student_features")).strip().lower()
+    if builder_token == "uci_student_features":
+        return build_uct_student_features(adapted, feature_cfg)
+    if builder_token == "uci_student_paper_style_features":
+        return build_uci_student_paper_style_features(adapted, feature_cfg)
+    raise ValueError(
+        "Unsupported UCT/UCI feature builder "
+        f"'{builder_token}'. Supported builders: "
+        "['uci_student_features', 'uci_student_paper_style_features']."
+    )
+
+
 def save_features(df: Any, dataset_cfg: dict[str, Any], base_dir: Path | None = None) -> Path:
     output_root = _resolve_path(
         dataset_cfg.get("paths", {}).get("processed_root", "data/processed/uct_student"),
@@ -87,7 +103,7 @@ def main() -> None:
     raw_df = load_uct_student_dataframe(dataset_cfg, base_dir=path_base_dir)
     adapted = adapt_uct_student_schema(raw_df, dataset_cfg.get("schema", {}))
     original_columns = list(adapted.get("data", raw_df).columns)
-    features = build_uct_student_features(adapted, dataset_cfg.get("features", {}))
+    features = _build_uct_feature_table(adapted, dataset_cfg.get("features", {}))
     out_path = save_features(features, dataset_cfg, base_dir=path_base_dir).resolve()
     derived_columns = _derive_new_columns(original_columns, features.columns.tolist())
 

@@ -154,6 +154,7 @@ def run_leakage_safe_stratified_cv(
     fold_results: list[dict[str, Any]] = []
 
     aggregate_keys = ("macro_f1", "accuracy", "balanced_accuracy", "macro_precision", "macro_recall")
+    label_order = [int(v) for v in eval_config.get("label_order", [])] if isinstance(eval_config.get("label_order", []), (list, tuple)) else []
 
     for fold_idx, (fit_idx, val_idx) in enumerate(skf.split(train_df, y_all), start=1):
         fold_train_df = train_df.iloc[fit_idx].reset_index(drop=True)
@@ -165,11 +166,16 @@ def run_leakage_safe_stratified_cv(
             "test": fold_valid_df,
         }
         fold_artifacts = run_tabular_preprocessing(split_payload, preprocess_config)
-        X_fold_train_filtered, y_fold_train_filtered, outlier_meta = apply_outlier_filter(
-            fold_artifacts.X_train,
-            fold_artifacts.y_train,
-            outlier_config,
-        )
+        if bool(outlier_config.get("apply_before_preprocessing", False)):
+            outlier_meta = dict(fold_artifacts.metadata.get("train_only_outlier", {}))
+            X_fold_train_filtered = fold_artifacts.X_train
+            y_fold_train_filtered = fold_artifacts.y_train
+        else:
+            X_fold_train_filtered, y_fold_train_filtered, outlier_meta = apply_outlier_filter(
+                fold_artifacts.X_train,
+                fold_artifacts.y_train,
+                outlier_config,
+            )
         X_fold_train_balanced, y_fold_train_balanced, balancing_meta = apply_balancing(
             X_fold_train_filtered,
             y_fold_train_filtered,
@@ -190,12 +196,14 @@ def run_leakage_safe_stratified_cv(
             eval_config=eval_config,
         )
         fold_metrics = {k: float(v) for k, v in fold_result.metrics.items() if k.startswith("test_")}
+        fold_per_class = fold_result.artifacts.get("per_class_metrics_test", {})
         fold_results.append(
             {
                 "fold_index": int(fold_idx),
                 "n_train": int(len(fold_train_df)),
                 "n_valid": int(len(fold_valid_df)),
                 "metrics": fold_metrics,
+                "per_class_metrics": fold_per_class,
                 "outlier": outlier_meta,
                 "balancing": balancing_meta,
             }
@@ -207,7 +215,41 @@ def run_leakage_safe_stratified_cv(
         arr = np.asarray(values, dtype=float)
         aggregate[f"cv_{metric_name}_mean"] = float(np.nanmean(arr))
         aggregate[f"cv_{metric_name}_std"] = float(np.nanstd(arr))
+    aggregate["cv_macro_f1"] = float(aggregate.get("cv_macro_f1_mean", np.nan))
+    aggregate["cv_macro_precision"] = float(aggregate.get("cv_macro_precision_mean", np.nan))
+    aggregate["cv_macro_recall"] = float(aggregate.get("cv_macro_recall_mean", np.nan))
     aggregate["cv_num_folds"] = int(n_splits)
+
+    per_class_aggregate: dict[str, dict[str, float]] = {}
+    resolved_labels = label_order or sorted(pd.Series(y_all).unique().astype(int).tolist())
+    for class_idx in resolved_labels:
+        class_key = str(int(class_idx))
+        precision_values = []
+        recall_values = []
+        f1_values = []
+        support_values = []
+        for fold in fold_results:
+            payload = fold.get("per_class_metrics", {})
+            class_payload = payload.get(class_key, {}) if isinstance(payload, dict) else {}
+            precision_values.append(float(class_payload.get("precision", np.nan)))
+            recall_values.append(float(class_payload.get("recall", np.nan)))
+            f1_values.append(float(class_payload.get("f1", np.nan)))
+            support_values.append(float(class_payload.get("support", np.nan)))
+        per_class_aggregate[class_key] = {
+            "precision_mean": float(np.nanmean(np.asarray(precision_values, dtype=float))),
+            "precision_std": float(np.nanstd(np.asarray(precision_values, dtype=float))),
+            "recall_mean": float(np.nanmean(np.asarray(recall_values, dtype=float))),
+            "recall_std": float(np.nanstd(np.asarray(recall_values, dtype=float))),
+            "f1_mean": float(np.nanmean(np.asarray(f1_values, dtype=float))),
+            "f1_std": float(np.nanstd(np.asarray(f1_values, dtype=float))),
+            "support_mean": float(np.nanmean(np.asarray(support_values, dtype=float))),
+        }
+        aggregate[f"cv_precision_class_{class_key}_mean"] = per_class_aggregate[class_key]["precision_mean"]
+        aggregate[f"cv_precision_class_{class_key}"] = per_class_aggregate[class_key]["precision_mean"]
+        aggregate[f"cv_recall_class_{class_key}_mean"] = per_class_aggregate[class_key]["recall_mean"]
+        aggregate[f"cv_recall_class_{class_key}"] = per_class_aggregate[class_key]["recall_mean"]
+        aggregate[f"cv_f1_class_{class_key}_mean"] = per_class_aggregate[class_key]["f1_mean"]
+        aggregate[f"cv_f1_class_{class_key}"] = per_class_aggregate[class_key]["f1_mean"]
 
     return {
         "config": {
@@ -217,6 +259,7 @@ def run_leakage_safe_stratified_cv(
         },
         "folds": fold_results,
         "aggregate_metrics": aggregate,
+        "per_class_aggregate_metrics": per_class_aggregate,
     }
 
 
